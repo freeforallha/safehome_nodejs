@@ -3,6 +3,13 @@ const fs = require("fs");
 const path = require("path");
 const mqtt = require("mqtt");
 const admin = require("firebase-admin");
+const { machineIdSync } = require("node-machine-id");
+const crypto = require("crypto");
+const rawId = machineIdSync();
+const DEVICE_ID =
+  "dev_" + crypto.createHash("sha256").update(rawId).digest("hex").slice(0, 16);
+
+console.log("🧠 DEVICE_ID:", DEVICE_ID);
 
 // ================= FIREBASE =================
 const serviceAccount = require("./serviceAccount.json");
@@ -13,37 +20,6 @@ admin.initializeApp({
     "https://safehome-10cc9-default-rtdb.asia-southeast1.firebasedatabase.app/",
 });
 const db = admin.database();
-// ================= HUB ID (FIXED) =================
-const { machineIdSync } = require("node-machine-id");
-
-let HUB_ID = null;
-
-async function ensureHubId() {
-  try {
-    const id = machineIdSync();
-
-    HUB_ID = "hub_" + id.substring(0, 12);
-
-    console.log("✅ FIXED HUB_ID:", HUB_ID);
-
-    return HUB_ID;
-  } catch (err) {
-    console.log("❌ HUB_ID ERROR:", err.message);
-
-    HUB_ID = "hub_unknown";
-    return HUB_ID;
-  }
-}
-// ================= REGISTER HUB =================
-async function registerHub() {
-  await db.ref(`system/hubs/${HUB_ID}`).set({
-    created: Date.now(),
-    last_seen: Date.now(),
-    status: "online",
-  });
-
-  console.log("📡 HUB REGISTERED:", HUB_ID);
-}
 
 // ================= MQTT =================
 const client = mqtt.connect("mqtt://localhost:1883");
@@ -92,17 +68,9 @@ function setPermitJoin(enable, time = 60) {
 
 // ================= INIT =================
 async function init() {
-  await ensureHubId();
-
-  console.log("🚀 HUB:", HUB_ID);
-
-  await registerHub();
-
   startDeviceMapListener();
 
-  setInterval(() => {
-    db.ref(`system/hubs/${HUB_ID}/last_seen`).set(Date.now());
-  }, 30000);
+  setInterval(() => {}, 30000);
 }
 
 init();
@@ -124,8 +92,7 @@ db.ref("system/pairing").on("value", async (snap) => {
     return;
   }
 
-  if (data.hubId !== HUB_ID) return;
-  if (pairingSession) return;
+  if (!data?.active) return;
 
   console.log("🟢 PAIRING START:", data.homeId);
 
@@ -146,7 +113,6 @@ db.ref("system/pairing").on("value", async (snap) => {
   pairingSession = {
     uid: data.requestedBy,
     homeId: data.homeId,
-    hubId: data.hubId,
     timeoutId,
   };
 });
@@ -176,12 +142,12 @@ async function sendAlarm(uid, homeId, reason) {
       token: token,
 
       data: {
-        type: "ALARM",
+        type: "alarm",
         title: "🚨 CẢNH BÁO",
         body: reason || "Có xâm nhập!",
         homeId: homeId || "",
         uid: uid || "",
-        clickAction: "ALARM_SCREEN",
+        clickAction: "alarm_SCREEN",
       },
 
       android: {
@@ -217,6 +183,26 @@ client.on("message", async (topic, msg) => {
 
         const { uid, homeId } = pairingSession;
 
+        // ================= CHECK DEVICE ĐÃ TỒN TẠI CHƯA =================
+        const snap = await db
+          .ref(`system/devices_by_ieee/${ieee}`)
+          .once("value");
+
+        const existing = snap.val();
+
+        if (existing?.uid && existing?.homeId) {
+          const oldRef = db.ref(
+            `accounts/${existing.uid}/homes/${existing.homeId}/devices/${ieee}`,
+          );
+
+          const snapOld = await oldRef.once("value");
+
+          if (snapOld.exists()) {
+            await oldRef.remove();
+          }
+        }
+
+        // ================= ADD DEVICE VÀO HOME MỚI =================
         await db.ref(`accounts/${uid}/homes/${homeId}/devices/${ieee}`).set({
           name: payload.friendly_name || ieee,
           ieee,
@@ -227,9 +213,18 @@ client.on("message", async (topic, msg) => {
           created: Date.now(),
         });
 
+        // ================= UPDATE GLOBAL INDEX =================
+        await db.ref(`system/devices_by_ieee/${ieee}`).set({
+          uid,
+          homeId,
+          deviceId: DEVICE_ID,
+          hubType: "raspberry_pi",
+          updatedAt: Date.now(),
+        });
+
         deviceMap[ieee] = { uid, homeId };
 
-        console.log("✅ DEVICE ADDED:", ieee);
+        console.log("✅ DEVICE READY:", ieee);
         return;
       }
     }
