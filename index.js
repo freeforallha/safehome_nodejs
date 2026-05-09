@@ -118,7 +118,13 @@ db.ref("system/pairing").on("value", async (snap) => {
 });
 // ================= ALARM PUSH =================
 const lastAlarmMap = {};
+function formatDateTime(ts) {
+  const d = new Date(ts);
 
+  const pad = (n) => n.toString().padStart(2, "0");
+
+  return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
 async function sendAlarm(uid, homeId, reason) {
   try {
     const now = Date.now();
@@ -243,7 +249,19 @@ client.on("message", async (topic, msg) => {
     let updateData = {
       last_seen: Date.now(),
     };
-
+    if (data.linkquality !== undefined) {
+      updateData.linkquality = data.linkquality;
+    }
+    updateData.last_seen_text = formatDateTime(Date.now());
+    if (data.linkquality !== undefined) {
+      if (data.linkquality < 50) {
+        updateData.signal_status = "weak";
+      } else if (data.linkquality < 100) {
+        updateData.signal_status = "medium";
+      } else {
+        updateData.signal_status = "strong";
+      }
+    }
     if (data.contact !== undefined) {
       updateData.status = data.contact ? "closed" : "open";
     }
