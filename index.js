@@ -70,7 +70,7 @@ function setPermitJoin(enable, time = 60) {
 async function init() {
   startDeviceMapListener();
 
-  setInterval(() => {}, 30000);
+  setInterval(() => { }, 30000);
 }
 
 init();
@@ -147,10 +147,13 @@ async function sendAlarm(uid, homeId, reason) {
     await admin.messaging().send({
       token: token,
 
-      data: {
-        type: "alarm",
+      notification: {
         title: "🚨 CẢNH BÁO",
         body: reason || "Có xâm nhập!",
+      },
+
+      data: {
+        type: "alarm",
         homeId: homeId || "",
         uid: uid || "",
         clickAction: "alarm_SCREEN",
@@ -158,6 +161,12 @@ async function sendAlarm(uid, homeId, reason) {
 
       android: {
         priority: "high",
+
+        notification: {
+          channelId: "alarm_channel",
+          sound: "default",
+          priority: "max",
+        },
       },
     });
 
@@ -280,7 +289,7 @@ client.on("message", async (topic, msg) => {
 
     console.log("📡 UPDATE:", deviceId, updateData);
     // ================= CHECK ALARM REALTIME =================
-    const alarmSnap = await db.ref(`accounts/${uid}/alarm`).once("value");
+    const alarmSnap = await db.ref(`accounts/${uid}/homes/${homeId}/alarm`).once("value");
     const alarm = alarmSnap.val() || {};
 
     if (alarm.enabled) {
