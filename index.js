@@ -175,6 +175,43 @@ async function sendAlarm(uid, homeId, reason) {
     console.log("FCM ERROR:", err.message);
   }
 }
+// ================= DEVICE NOTIFICATION =================
+async function addDeviceNotification(
+  uid,
+  homeId,
+  deviceId,
+  text,
+  type = "status",
+) {
+  try {
+    const ref = db.ref(
+      `accounts/${uid}/homes/${homeId}/devices/${deviceId}/notifications/${Date.now()}`,
+    );
+
+    await ref.set({
+      time: Date.now(),
+      text,
+      type,
+    });
+    const notifSnap = await deviceRef.child("notifications").once("value");
+
+    const notif = notifSnap.val() || {};
+
+    const keys = Object.keys(notif);
+
+    if (keys.length > 100) {
+      keys.sort();
+
+      await deviceRef
+        .child(`notifications/${keys[0]}`)
+        .remove();
+    }
+
+    console.log("📝 NOTIFICATION:", text);
+  } catch (err) {
+    console.log("NOTIFICATION ERROR:", err.message);
+  }
+}
 
 // ================= MQTT HANDLER =================
 client.on("message", async (topic, msg) => {
@@ -255,6 +292,16 @@ client.on("message", async (topic, msg) => {
 
     const { uid, homeId } = map;
 
+    const deviceRef = db.ref(
+      `accounts/${uid}/homes/${homeId}/devices/${deviceId}`,
+    );
+
+    const oldSnap = await deviceRef.once("value");
+    const oldData = oldSnap.val() || {};
+
+    const oldStatus = oldData.status;
+    const oldTamper = oldData.tamper;
+
     let updateData = {
       last_seen: Date.now(),
     };
@@ -283,9 +330,39 @@ client.on("message", async (topic, msg) => {
       updateData.battery = data.battery;
     }
 
-    await db
-      .ref(`accounts/${uid}/homes/${homeId}/devices/${deviceId}`)
-      .update(updateData);
+    await deviceRef.update(updateData);
+
+    // ================= STATUS NOTIFICATION =================
+    if (
+      updateData.status !== undefined &&
+      updateData.status !== oldStatus
+    ) {
+      await addDeviceNotification(
+        uid,
+        homeId,
+        deviceId,
+        updateData.status === "open"
+          ? "Door opened"
+          : "Door closed",
+        "status",
+      );
+    }
+
+    // ================= TAMPER NOTIFICATION =================
+    if (
+      updateData.tamper !== undefined &&
+      updateData.tamper !== oldTamper
+    ) {
+      await addDeviceNotification(
+        uid,
+        homeId,
+        deviceId,
+        updateData.tamper
+          ? "Tamper detected"
+          : "Tamper cleared",
+        "tamper",
+      );
+    }
 
     console.log("📡 UPDATE:", deviceId, updateData);
     // ================= CHECK ALARM REALTIME =================
