@@ -6,6 +6,7 @@ const admin = require("firebase-admin");
 const { machineIdSync } = require("node-machine-id");
 const crypto = require("crypto");
 const rawId = machineIdSync();
+const lastHeartbeatMap = {};
 const DEVICE_ID =
   "dev_" + crypto.createHash("sha256").update(rawId).digest("hex").slice(0, 16);
 
@@ -331,6 +332,31 @@ client.on("message", async (topic, msg) => {
     }
 
     await deviceRef.update(updateData);
+    // ================= HEARTBEAT LOG =================
+    const heartbeatKey = `${uid}_${homeId}_${deviceId}`;
+
+    const now = Date.now();
+
+    if (
+      !lastHeartbeatMap[heartbeatKey] ||
+      now - lastHeartbeatMap[heartbeatKey] > 300000
+    ) {
+      lastHeartbeatMap[heartbeatKey] = now;
+
+      await addDeviceNotification(
+        uid,
+        homeId,
+        deviceId,
+        `Cập nhật| ${(updateData.status ?? oldData.status) === "closed"
+          ? "Đóng"
+          : "Mở"
+        } | ${(updateData.tamper ?? oldData.tamper)
+          ? "Bị tháo"
+          : "Bình thường"
+        } | Pin: ${updateData.battery ?? oldData.battery ?? "?"}% | Tín hiệu: ${updateData.linkquality ?? oldData.linkquality ?? "?"}`,
+        "heartbeat",
+      );
+    }
 
     // ================= STATUS NOTIFICATION =================
     if (
