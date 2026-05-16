@@ -11,6 +11,9 @@ const DEVICE_ID =
   "dev_" + crypto.createHash("sha256").update(rawId).digest("hex").slice(0, 16);
 
 console.log("🧠 DEVICE_ID:", DEVICE_ID);
+const ALLOWED_HUBS = new Set([
+  DEVICE_ID,
+]);
 
 // ================= FIREBASE =================
 const serviceAccount = require("./serviceAccount.json");
@@ -93,23 +96,23 @@ db.ref("system/pairing").on("value", async (snap) => {
     return;
   }
 
-  if (!data?.active) return;
+  // 🔥 CHECK HUB ID (QUAN TRỌNG NHẤT)
+  if (data.hubId && data.hubId !== DEVICE_ID) {
+    console.log("❌ INVALID HUB:", data.hubId);
+    return;
+  }
 
   console.log("🟢 PAIRING START:", data.homeId);
 
   await setPermitJoin(true, data.duration || 60);
 
-  const timeoutId = setTimeout(
-    async () => {
-      await setPermitJoin(false);
-      await db.ref("system/pairing").set(null);
+  const timeoutId = setTimeout(async () => {
+    await setPermitJoin(false);
+    await db.ref("system/pairing").set(null);
 
-      pairingSession = null;
-
-      console.log("🔴 PAIRING END");
-    },
-    (data.duration || 60) * 1000,
-  );
+    pairingSession = null;
+    console.log("🔴 PAIRING END");
+  }, (data.duration || 60) * 1000);
 
   pairingSession = {
     uid: data.requestedBy,
