@@ -104,7 +104,17 @@ db.ref("pair_requests").on("child_added", async (snap) => {
 
   console.log("🟢 PAIR START:", key, data.homeId);
 
-  pairingSession = { key };
+  // 🔥 CHECK TRƯỚC KHI SET SESSION
+  if (!data?.requestedBy || !data?.homeId) {
+    console.log("❌ INVALID PAIR REQUEST DATA", data);
+    return;
+  }
+
+  pairingSession = {
+    key,
+    uid: data.requestedBy,
+    homeId: data.homeId,
+  };
 
   await setPermitJoin(true, data.duration || 60);
 
