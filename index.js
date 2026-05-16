@@ -87,38 +87,40 @@ client.on("connect", () => {
 });
 
 // ================= PAIRING =================
-db.ref("system/pairing").on("value", async (snap) => {
+db.ref("pair_requests").on("child_added", async (snap) => {
   const data = snap.val();
+  const key = snap.key;
 
-  if (!data?.active) {
-    if (pairingSession?.timeoutId) clearTimeout(pairingSession.timeoutId);
-    pairingSession = null;
-    return;
-  }
+  if (!data) return;
 
-  // 🔥 CHECK HUB ID (QUAN TRỌNG NHẤT)
-  if (data.hubId && data.hubId !== DEVICE_ID) {
-    console.log("❌ INVALID HUB:", data.hubId);
-    return;
-  }
+  // 🔥 chỉ xử lý khi active = true
+  if (data.active !== true) return;
 
-  console.log("🟢 PAIRING START:", data.homeId);
+  // 🔥 FIX: compare hubId an toàn
+  if ((data.hubId || "").trim() !== DEVICE_ID.trim()) return;
+
+  // tránh chạy lại nhiều lần
+  if (pairingSession?.key === key) return;
+
+  console.log("🟢 PAIR START:", key, data.homeId);
+
+  pairingSession = { key };
 
   await setPermitJoin(true, data.duration || 60);
 
-  const timeoutId = setTimeout(async () => {
+  // 🔥 AUTO CLEANUP
+  setTimeout(async () => {
     await setPermitJoin(false);
-    await db.ref("system/pairing").set(null);
+
+    await db.ref(`pair_requests/${key}`).remove();
 
     pairingSession = null;
-    console.log("🔴 PAIRING END");
-  }, (data.duration || 60) * 1000);
 
-  pairingSession = {
-    uid: data.requestedBy,
-    homeId: data.homeId,
-    timeoutId,
-  };
+    console.log("🧹 PAIR DONE + REMOVED:", key);
+  }, (data.duration || 60) * 1000);
+});
+db.ref("pair_requests").on("child_removed", (snap) => {
+  console.log("🧹 REQUEST REMOVED:", snap.key);
 });
 // ================= ALARM PUSH =================
 const lastAlarmMap = {};
