@@ -3,14 +3,34 @@ const fs = require("fs");
 const path = require("path");
 const mqtt = require("mqtt");
 const admin = require("firebase-admin");
-const { machineIdSync } = require("node-machine-id");
 const crypto = require("crypto");
-const rawId = machineIdSync();
+
 const lastHeartbeatMap = {};
+
+function getPiSerial() {
+  try {
+    const cpuInfo = fs.readFileSync("/proc/cpuinfo", "utf8");
+    const match = cpuInfo.match(/Serial\s*:\s*(.+)/);
+
+    if (match && match[1]) {
+      return match[1].trim();
+    }
+
+    return "unknown_serial";
+  } catch (err) {
+    console.log("CPU INFO ERROR:", err);
+    return "unknown_serial";
+  }
+}
+
+const rawId = getPiSerial();
+
 const DEVICE_ID =
-  "dev_" + crypto.createHash("sha256").update(rawId).digest("hex").slice(0, 16);
+  "dev_" +
+  crypto.createHash("sha256").update(rawId).digest("hex").slice(0, 16);
 
 console.log("🧠 DEVICE_ID:", DEVICE_ID);
+
 const ALLOWED_HUBS = new Set([
   DEVICE_ID,
 ]);
@@ -164,8 +184,8 @@ async function sendAlarm(uid, homeId, reason) {
       token: token,
 
       notification: {
-        title: "🚨 CẢNH BÁO",
-        body: reason || "Có xâm nhập!",
+        title: "🚨 SAFEHOME",
+        body: reason || "Có cảnh báo!",
       },
 
       data: {
@@ -230,6 +250,61 @@ async function addDeviceNotification(
 }
 
 // ================= MQTT HANDLER =================
+async function processAlarmForUser(
+  uid,
+  homeId,
+  homeName,
+  deviceName,
+  alarm,
+  updateData,
+) {
+  if (!alarm.enabled) return;
+
+  function toMin(t) {
+    const [h, m] = (t || "00:00").split(":").map(Number);
+    return h * 60 + m;
+  }
+
+  const now = new Date();
+
+  const nowMin =
+    now.getHours() * 60 + now.getMinutes();
+
+  const start = toMin(alarm.start || "23:00");
+  const end = toMin(alarm.end || "06:00");
+
+  let inTime = false;
+
+  // qua đêm
+  if (start > end) {
+    inTime = nowMin >= start || nowMin <= end;
+  } else {
+    inTime = nowMin >= start && nowMin <= end;
+  }
+
+  if (!inTime) return;
+
+  // ===== CHECK STATUS =====
+  if (
+    updateData.status &&
+    updateData.status !== "closed"
+  ) {
+    await sendAlarm(
+      uid,
+      homeId,
+      `Nhà ${homeName} - ${deviceName}: Cửa mở bất thường`,
+    );
+  }
+
+  // ===== CHECK TAMPER =====
+  if (updateData.tamper === true) {
+    await sendAlarm(
+      uid,
+      homeId,
+      `Nhà ${homeName} - ${deviceName}: Thiết bị bị tháo`,
+    );
+  }
+}
 client.on("message", async (topic, msg) => {
   try {
     const data = JSON.parse(msg.toString());
@@ -311,9 +386,18 @@ client.on("message", async (topic, msg) => {
     const deviceRef = db.ref(
       `accounts/${uid}/homes/${homeId}/devices/${deviceId}`,
     );
+    const deviceSnap = await deviceRef.once("value");
+    const deviceData = deviceSnap.val() || {};
+    const deviceName = deviceData.name || deviceId;
 
     const oldSnap = await deviceRef.once("value");
     const oldData = oldSnap.val() || {};
+    const homeSnap = await db
+      .ref(`accounts/${uid}/homes/${homeId}`)
+      .once("value");
+
+    const homeData = homeSnap.val() || {};
+    const homeName = homeData.name || homeId;
 
     const oldStatus = oldData.status;
     const oldTamper = oldData.tamper;
@@ -406,41 +490,44 @@ client.on("message", async (topic, msg) => {
     }
 
     console.log("📡 UPDATE:", deviceId, updateData);
-    // ================= CHECK ALARM REALTIME =================
-    const alarmSnap = await db.ref(`accounts/${uid}/homes/${homeId}/alarm`).once("value");
-    const alarm = alarmSnap.val() || {};
+    // ================= CHECK OWNER ALARM =================
+    const ownerAlarmSnap = await db
+      .ref(`accounts/${uid}/homes/${homeId}/alarm`)
+      .once("value");
 
-    if (alarm.enabled) {
-      function toMin(t) {
-        const [h, m] = t.split(":").map(Number);
-        return h * 60 + m;
-      }
+    const ownerAlarm = ownerAlarmSnap.val() || {};
 
-      const now = new Date();
-      const nowMin = now.getHours() * 60 + now.getMinutes();
+    await processAlarmForUser(
+      uid,
+      homeId,
+      homeName,
+      deviceName,
+      ownerAlarm,
+      updateData,
+    );
 
-      const start = toMin(alarm.start || "23:00");
-      const end = toMin(alarm.end || "06:00");
+    // ================= CHECK SHARED USERS =================
+    const sharedSnap = await db
+      .ref(`sharedByHome/${homeId}`)
+      .once("value");
 
-      let inTime = false;
+    const sharedMap = sharedSnap.val() || {};
 
-      if (start > end) {
-        inTime = nowMin >= start || nowMin <= end;
-      } else {
-        inTime = nowMin >= start && nowMin <= end;
-      }
-      console.log("⏰ ALARM CHECK:", updateData, "inTime:", inTime);
+    for (const sharedUid of Object.keys(sharedMap)) {
+      const sharedAlarmSnap = await db
+        .ref(`accounts/${sharedUid}/sharedHomes/${homeId}/alarm`)
+        .once("value");
 
-      if (!inTime) return;
+      const sharedAlarm = sharedAlarmSnap.val() || {};
 
-      // ===== CHECK NGUY HIỂM =====
-      if (updateData.status && updateData.status !== "closed") {
-        await sendAlarm(uid, homeId, "Cửa chưa đóng");
-      }
-
-      if (updateData.tamper === true) {
-        await sendAlarm(uid, homeId, "Phát hiện tháo thiết bị");
-      }
+      await processAlarmForUser(
+        sharedUid,
+        homeId,
+        homeName,
+        deviceName,
+        sharedAlarm,
+        updateData,
+      );
     }
   } catch (err) {
     console.log("MQTT ERROR:", err.message);
