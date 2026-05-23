@@ -94,7 +94,11 @@ function setPermitJoin(enable, time = 60) {
 async function init() {
   startDeviceMapListener();
 
-  setInterval(() => { }, 30000);
+  // cleanup old pair requests
+  await db.ref("pair_requests").remove();
+  console.log("🧹 OLD PAIR REQUESTS CLEARED");
+
+  setInterval(() => {}, 30000);
 }
 
 init();
@@ -112,6 +116,15 @@ db.ref("pair_requests").on("child_added", async (snap) => {
   const key = snap.key;
 
   if (!data) return;
+    // 🔥 ALWAYS AUTO CLEANUP
+  setTimeout(async () => {
+    try {
+      await db.ref(`pair_requests/${key}`).remove();
+      console.log("🧹 PAIR REQUEST REMOVED:", key);
+    } catch (e) {
+      console.log("❌ REMOVE ERROR:", e.message);
+    }
+  }, (data.duration || 60) * 1000);
 
   // 🔥 chỉ xử lý khi active = true
   if (data.active !== true) return;
@@ -141,9 +154,6 @@ db.ref("pair_requests").on("child_added", async (snap) => {
   // 🔥 AUTO CLEANUP
   setTimeout(async () => {
     await setPermitJoin(false);
-
-    await db.ref(`pair_requests/${key}`).remove();
-
     pairingSession = null;
 
     console.log("🧹 PAIR DONE + REMOVED:", key);
