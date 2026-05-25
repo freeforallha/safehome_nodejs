@@ -1,11 +1,12 @@
 // 🔥 CORE
 const fs = require("fs");
-const path = require("path");
 const mqtt = require("mqtt");
 const admin = require("firebase-admin");
 const crypto = require("crypto");
 
 const lastHeartbeatMap = {};
+const lastAlarmMap = {};
+const lastNotificationMap = {};
 
 function getPiSerial() {
   try {
@@ -31,10 +32,6 @@ const DEVICE_ID =
 
 console.log("🧠 DEVICE_ID:", DEVICE_ID);
 
-const ALLOWED_HUBS = new Set([
-  DEVICE_ID,
-]);
-
 // ================= FIREBASE =================
 const serviceAccount = require("./serviceAccount.json");
 
@@ -43,6 +40,7 @@ admin.initializeApp({
   databaseURL:
     "https://safehome-10cc9-default-rtdb.asia-southeast1.firebasedatabase.app/",
 });
+
 const db = admin.database();
 
 // ================= MQTT =================
@@ -52,6 +50,64 @@ const client = mqtt.connect("mqtt://localhost:1883");
 let deviceMap = {};
 let pairingSession = null;
 
+// ================= TIME =================
+function formatDateTime(ts) {
+  const d = new Date(ts);
+  const pad = (n) => n.toString().padStart(2, "0");
+
+  return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} ${pad(
+    d.getHours(),
+  )}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+function getCurrentHHMM() {
+  const now = new Date();
+
+  const hh = now.getHours().toString().padStart(2, "0");
+  const mm = now.getMinutes().toString().padStart(2, "0");
+
+  return `${hh}:${mm}`;
+}
+
+function toMin(t) {
+  const [h, m] = (t || "00:00").split(":").map(Number);
+  return h * 60 + m;
+}
+
+function isNowInRange(startTime, endTime) {
+  const now = new Date();
+  const nowMin = now.getHours() * 60 + now.getMinutes();
+
+  const start = toMin(startTime || "23:00");
+  const end = toMin(endTime || "06:00");
+
+  if (start > end) {
+    return nowMin >= start || nowMin <= end;
+  }
+
+  return nowMin >= start && nowMin <= end;
+}
+function getHomeSafety(home) {
+  const devices = home.devices || {};
+  const unsafeDevices = [];
+
+  for (const [deviceId, device] of Object.entries(devices)) {
+    const name = device.name || deviceId;
+
+    if (device.status !== "closed") {
+      unsafeDevices.push(`${name} đang mở`);
+    }
+
+    if (device.tamper === true) {
+      unsafeDevices.push(`${name} bị tháo`);
+    }
+  }
+
+  return {
+    safe: unsafeDevices.length === 0,
+    unsafeDevices,
+  };
+}
 // ================= DEVICE LISTENER =================
 function startDeviceMapListener() {
   db.ref("accounts").on("value", (snap) => {
@@ -90,87 +146,60 @@ function setPermitJoin(enable, time = 60) {
   });
 }
 
-// ================= INIT =================
-async function init() {
-  startDeviceMapListener();
-
-  // cleanup old pair requests
-  await db.ref("pair_requests").remove();
-  console.log("🧹 OLD PAIR REQUESTS CLEARED");
-
-  setInterval(() => {}, 30000);
-}
-
-init();
-
-// ================= MQTT CONNECT =================
-client.on("connect", () => {
-  console.log("MQTT CONNECTED");
-  client.subscribe("zigbee2mqtt/#");
-  client.subscribe("zigbee2mqtt/bridge/event");
-});
-
-// ================= PAIRING =================
-db.ref("pair_requests").on("child_added", async (snap) => {
-  const data = snap.val();
-  const key = snap.key;
-
-  if (!data) return;
-    // 🔥 ALWAYS AUTO CLEANUP
-  setTimeout(async () => {
-    try {
-      await db.ref(`pair_requests/${key}`).remove();
-      console.log("🧹 PAIR REQUEST REMOVED:", key);
-    } catch (e) {
-      console.log("❌ REMOVE ERROR:", e.message);
+// ================= PUSH =================
+async function sendScheduledNotification(uid, homeId, text) {
+  try {
+    const now = Date.now();
+const key = `${uid}_${homeId}_${text}_${getCurrentHHMM()}`;
+    // chống spam trong 55 phút
+    if (
+      lastNotificationMap[key] &&
+      now - lastNotificationMap[key] <70* 1000
+    ) {
+      return;
     }
-  }, (data.duration || 60) * 1000);
 
-  // 🔥 chỉ xử lý khi active = true
-  if (data.active !== true) return;
+    lastNotificationMap[key] = now;
 
-  // 🔥 FIX: compare hubId an toàn
-  if ((data.hubId || "").trim() !== DEVICE_ID.trim()) return;
+    const snap = await db.ref(`accounts/${uid}/fcmToken`).once("value");
+    const token = snap.val();
 
-  // tránh chạy lại nhiều lần
-  if (pairingSession?.key === key) return;
+    if (!token) {
+      console.log("❌ NO TOKEN FOR SCHEDULE:", uid);
+      return;
+    }
 
-  console.log("🟢 PAIR START:", key, data.homeId);
+    await admin.messaging().send({
+      token,
 
-  // 🔥 CHECK TRƯỚC KHI SET SESSION
-  if (!data?.requestedBy || !data?.homeId) {
-    console.log("❌ INVALID PAIR REQUEST DATA", data);
-    return;
+      notification: {
+        title: "🏡 SAFEHOME",
+        body: text,
+      },
+
+      data: {
+        type: "schedule_notification",
+        homeId: homeId || "",
+        uid: uid || "",
+        clickAction: "schedule_SCREEN",
+      },
+
+      android: {
+        priority: "high",
+
+        notification: {
+          channelId: "schedule_channel",
+          priority: "max",
+        },
+      },
+    });
+
+    console.log("🔔 SCHEDULE NOTIFICATION:", uid, homeId, text);
+  } catch (err) {
+    console.log("NOTIFICATION SEND ERROR:", err.message);
   }
-
-  pairingSession = {
-    key,
-    uid: data.requestedBy,
-    homeId: data.homeId,
-  };
-
-  await setPermitJoin(true, data.duration || 60);
-
-  // 🔥 AUTO CLEANUP
-  setTimeout(async () => {
-    await setPermitJoin(false);
-    pairingSession = null;
-
-    console.log("🧹 PAIR DONE + REMOVED:", key);
-  }, (data.duration || 60) * 1000);
-});
-db.ref("pair_requests").on("child_removed", (snap) => {
-  console.log("🧹 REQUEST REMOVED:", snap.key);
-});
-// ================= ALARM PUSH =================
-const lastAlarmMap = {};
-function formatDateTime(ts) {
-  const d = new Date(ts);
-
-  const pad = (n) => n.toString().padStart(2, "0");
-
-  return `${pad(d.getDate())}/${pad(d.getMonth() + 1)}/${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 }
+
 async function sendAlarm(uid, homeId, reason) {
   try {
     const now = Date.now();
@@ -180,6 +209,7 @@ async function sendAlarm(uid, homeId, reason) {
     if (lastAlarmMap[key] && now - lastAlarmMap[key] < 15000) {
       return;
     }
+
     lastAlarmMap[key] = now;
 
     const snap = await db.ref(`accounts/${uid}/fcmToken`).once("value");
@@ -191,7 +221,7 @@ async function sendAlarm(uid, homeId, reason) {
     }
 
     await admin.messaging().send({
-      token: token,
+      token,
 
       notification: {
         title: "🚨 SAFEHOME",
@@ -221,7 +251,63 @@ async function sendAlarm(uid, homeId, reason) {
     console.log("FCM ERROR:", err.message);
   }
 }
-// ================= DEVICE NOTIFICATION =================
+
+// ================= SCHEDULE CHECK =================
+async function checkScheduledNotifications() {
+  try {
+    const snap = await db.ref("accounts").once("value");
+    const accounts = snap.val() || {};
+    const current = getCurrentHHMM();
+
+    console.log("⏰ CHECK SCHEDULE:", current);
+
+    for (const [uid, user] of Object.entries(accounts)) {
+      const homes = user.homes || {};
+
+      for (const [homeId, home] of Object.entries(homes)) {
+        const schedules = home.schedules || {};
+        const notificationsRaw = schedules.notifications || {};
+        const notifications = Array.isArray(notificationsRaw)
+          ? notificationsRaw
+          : Object.values(notificationsRaw);
+
+        for (const item of notifications) {
+
+          if (!item || item.enabled !== true) {
+            continue;
+          }
+
+          if (item.time !== current) {
+            continue;
+          }
+
+          const homeName = home.name || homeId;
+          const safety = getHomeSafety(home);
+
+          if (safety.safe) {
+            await sendScheduledNotification(
+              uid,
+              homeId,
+              "Nhà bạn đã an toàn, hãy an tâm đi ngủ.",
+            );
+          } else {
+            const detail = safety.unsafeDevices.slice(0, 3).join(", ");
+
+            await sendScheduledNotification(
+              uid,
+              homeId,
+              `⚠️ Nhà ${homeName} chưa an toàn: ${detail}`,
+            );
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.log("SCHEDULE CHECK ERROR:", err.message);
+  }
+}
+
+// ================= DEVICE NOTIFICATION LOG =================
 async function addDeviceNotification(
   uid,
   homeId,
@@ -230,27 +316,32 @@ async function addDeviceNotification(
   type = "status",
 ) {
   try {
-    const ref = db.ref(
-      `accounts/${uid}/homes/${homeId}/devices/${deviceId}/notifications/${Date.now()}`,
+    const now = Date.now();
+
+    const deviceRef = db.ref(
+      `accounts/${uid}/homes/${homeId}/devices/${deviceId}`,
     );
 
-    await ref.set({
-      time: Date.now(),
+    const notifRef = deviceRef.child(`notifications/${now}`);
+
+    await notifRef.set({
+      time: now,
       text,
       type,
     });
+
     const notifSnap = await deviceRef.child("notifications").once("value");
-
     const notif = notifSnap.val() || {};
-
     const keys = Object.keys(notif);
 
     if (keys.length > 100) {
       keys.sort();
 
-      await deviceRef
-        .child(`notifications/${keys[0]}`)
-        .remove();
+      const keysToRemove = keys.slice(0, keys.length - 100);
+
+      for (const key of keysToRemove) {
+        await deviceRef.child(`notifications/${key}`).remove();
+      }
     }
 
     console.log("📝 NOTIFICATION:", text);
@@ -259,7 +350,7 @@ async function addDeviceNotification(
   }
 }
 
-// ================= MQTT HANDLER =================
+// ================= ALARM LOGIC =================
 async function processAlarmForUser(
   uid,
   homeId,
@@ -268,37 +359,13 @@ async function processAlarmForUser(
   alarm,
   updateData,
 ) {
-  if (!alarm.enabled) return;
+  if (!alarm || alarm.enabled !== true) return;
 
-  function toMin(t) {
-    const [h, m] = (t || "00:00").split(":").map(Number);
-    return h * 60 + m;
-  }
-
-  const now = new Date();
-
-  const nowMin =
-    now.getHours() * 60 + now.getMinutes();
-
-  const start = toMin(alarm.start || "23:00");
-  const end = toMin(alarm.end || "06:00");
-
-  let inTime = false;
-
-  // qua đêm
-  if (start > end) {
-    inTime = nowMin >= start || nowMin <= end;
-  } else {
-    inTime = nowMin >= start && nowMin <= end;
-  }
+  const inTime = isNowInRange(alarm.start || "23:00", alarm.end || "06:00");
 
   if (!inTime) return;
 
-  // ===== CHECK STATUS =====
-  if (
-    updateData.status &&
-    updateData.status !== "closed"
-  ) {
+  if (updateData.status && updateData.status !== "closed") {
     await sendAlarm(
       uid,
       homeId,
@@ -306,7 +373,6 @@ async function processAlarmForUser(
     );
   }
 
-  // ===== CHECK TAMPER =====
   if (updateData.tamper === true) {
     await sendAlarm(
       uid,
@@ -315,6 +381,114 @@ async function processAlarmForUser(
     );
   }
 }
+
+async function processScheduleAlarmsForOwner(
+  uid,
+  homeId,
+  homeName,
+  deviceName,
+  homeData,
+  updateData,
+) {
+  const schedules = homeData.schedules || {};
+  const alarms = schedules.alarms || [];
+
+  for (const item of alarms) {
+    if (!item || item.enabled !== true) continue;
+
+    const inTime = isNowInRange(item.start, item.end);
+
+    if (!inTime) continue;
+
+    if (updateData.status && updateData.status !== "closed") {
+      await sendAlarm(
+        uid,
+        homeId,
+        `Nhà ${homeName} - ${deviceName}: Cửa mở bất thường`,
+      );
+      return;
+    }
+
+    if (updateData.tamper === true) {
+      await sendAlarm(
+        uid,
+        homeId,
+        `Nhà ${homeName} - ${deviceName}: Thiết bị bị tháo`,
+      );
+      return;
+    }
+  }
+}
+
+// ================= INIT =================
+async function init() {
+  startDeviceMapListener();
+
+  await db.ref("pair_requests").remove();
+  console.log("🧹 OLD PAIR REQUESTS CLEARED");
+
+  setInterval(checkScheduledNotifications, 60000);
+}
+
+init();
+
+// ================= MQTT CONNECT =================
+client.on("connect", () => {
+  console.log("MQTT CONNECTED");
+  client.subscribe("zigbee2mqtt/#");
+  client.subscribe("zigbee2mqtt/bridge/event");
+});
+
+// ================= PAIRING =================
+db.ref("pair_requests").on("child_added", async (snap) => {
+  const data = snap.val();
+  const key = snap.key;
+
+  if (!data) return;
+
+  setTimeout(async () => {
+    try {
+      await db.ref(`pair_requests/${key}`).remove();
+      console.log("🧹 PAIR REQUEST REMOVED:", key);
+    } catch (e) {
+      console.log("❌ REMOVE ERROR:", e.message);
+    }
+  }, (data.duration || 60) * 1000);
+
+  if (data.active !== true) return;
+
+  if ((data.hubId || "").trim() !== DEVICE_ID.trim()) return;
+
+  if (pairingSession?.key === key) return;
+
+  console.log("🟢 PAIR START:", key, data.homeId);
+
+  if (!data?.requestedBy || !data?.homeId) {
+    console.log("❌ INVALID PAIR REQUEST DATA", data);
+    return;
+  }
+
+  pairingSession = {
+    key,
+    uid: data.requestedBy,
+    homeId: data.homeId,
+  };
+
+  await setPermitJoin(true, data.duration || 60);
+
+  setTimeout(async () => {
+    await setPermitJoin(false);
+    pairingSession = null;
+
+    console.log("🧹 PAIR DONE:", key);
+  }, (data.duration || 60) * 1000);
+});
+
+db.ref("pair_requests").on("child_removed", (snap) => {
+  console.log("🧹 REQUEST REMOVED:", snap.key);
+});
+
+// ================= MQTT HANDLER =================
 client.on("message", async (topic, msg) => {
   try {
     const data = JSON.parse(msg.toString());
@@ -336,7 +510,6 @@ client.on("message", async (topic, msg) => {
 
         const { uid, homeId } = pairingSession;
 
-        // ================= CHECK DEVICE ĐÃ TỒN TẠI CHƯA =================
         const snap = await db
           .ref(`system/devices_by_ieee/${ieee}`)
           .once("value");
@@ -355,7 +528,6 @@ client.on("message", async (topic, msg) => {
           }
         }
 
-        // ================= ADD DEVICE VÀO HOME MỚI =================
         await db.ref(`accounts/${uid}/homes/${homeId}/devices/${ieee}`).set({
           name: payload.friendly_name || ieee,
           ieee,
@@ -363,10 +535,10 @@ client.on("message", async (topic, msg) => {
           tamper: false,
           battery: 100,
           last_seen: Date.now(),
+          last_event: Date.now(),
           created: Date.now(),
         });
 
-        // ================= UPDATE GLOBAL INDEX =================
         await db.ref(`system/devices_by_ieee/${ieee}`).set({
           uid,
           homeId,
@@ -396,12 +568,11 @@ client.on("message", async (topic, msg) => {
     const deviceRef = db.ref(
       `accounts/${uid}/homes/${homeId}/devices/${deviceId}`,
     );
-    const deviceSnap = await deviceRef.once("value");
-    const deviceData = deviceSnap.val() || {};
-    const deviceName = deviceData.name || deviceId;
 
     const oldSnap = await deviceRef.once("value");
     const oldData = oldSnap.val() || {};
+    const deviceName = oldData.name || deviceId;
+
     const homeSnap = await db
       .ref(`accounts/${uid}/homes/${homeId}`)
       .once("value");
@@ -412,14 +583,13 @@ client.on("message", async (topic, msg) => {
     const oldStatus = oldData.status;
     const oldTamper = oldData.tamper;
 
-    let updateData = {
-      last_seen: Date.now(),
-    };
+    const now = Date.now();
+
+    let updateData = {};
+
     if (data.linkquality !== undefined) {
       updateData.linkquality = data.linkquality;
-    }
-    updateData.last_seen_text = formatDateTime(Date.now());
-    if (data.linkquality !== undefined) {
+
       if (data.linkquality < 50) {
         updateData.signal_status = "weak";
       } else if (data.linkquality < 100) {
@@ -428,84 +598,65 @@ client.on("message", async (topic, msg) => {
         updateData.signal_status = "strong";
       }
     }
+
+    updateData.last_seen_text = formatDateTime(now);
+
     if (data.contact !== undefined) {
-      updateData.status = data.contact ? "closed" : "open";
+      const newStatus = data.contact ? "closed" : "open";
+      updateData.status = newStatus;
+
+      if (newStatus !== oldStatus) {
+        updateData.last_event = now;
+      }
     }
 
     if (data.tamper !== undefined) {
-      updateData.tamper = data.tamper;
+      const newTamper = data.tamper;
+      updateData.tamper = newTamper;
+
+      if (newTamper !== oldTamper) {
+        updateData.last_event = now;
+      }
     }
 
     if (data.battery !== undefined) {
       updateData.battery = data.battery;
     }
 
-    await deviceRef.update(updateData);
-    // ================= HEARTBEAT LOG =================
-    const heartbeatKey = `${uid}_${homeId}_${deviceId}`;
+    const hasEvent =
+      (data.contact !== undefined && updateData.status !== oldStatus) ||
+      (data.tamper !== undefined && updateData.tamper !== oldTamper);
 
-    const now = Date.now();
-
-    if (
-      !lastHeartbeatMap[heartbeatKey] ||
-      now - lastHeartbeatMap[heartbeatKey] > 300000
-    ) {
-      lastHeartbeatMap[heartbeatKey] = now;
-
-      await addDeviceNotification(
-        uid,
-        homeId,
-        deviceId,
-        `Cập nhật| ${(updateData.status ?? oldData.status) === "closed"
-          ? "Đóng"
-          : "Mở"
-        } | ${(updateData.tamper ?? oldData.tamper)
-          ? "Bị tháo"
-          : "Bình thường"
-        } | Pin: ${updateData.battery ?? oldData.battery ?? "?"}% | Tín hiệu: ${updateData.linkquality ?? oldData.linkquality ?? "?"}`,
-        "heartbeat",
-      );
+    if (!hasEvent) {
+      updateData.last_seen = now;
     }
 
-    // ================= STATUS NOTIFICATION =================
-    if (
-      updateData.status !== undefined &&
-      updateData.status !== oldStatus
-    ) {
+    await deviceRef.update(updateData);
+
+    if (updateData.status !== undefined && updateData.status !== oldStatus) {
       await addDeviceNotification(
         uid,
         homeId,
         deviceId,
-        updateData.status === "open"
-          ? "Door opened"
-          : "Door closed",
+        updateData.status === "open" ? "Door opened" : "Door closed",
         "status",
       );
     }
 
-    // ================= TAMPER NOTIFICATION =================
-    if (
-      updateData.tamper !== undefined &&
-      updateData.tamper !== oldTamper
-    ) {
+    if (updateData.tamper !== undefined && updateData.tamper !== oldTamper) {
       await addDeviceNotification(
         uid,
         homeId,
         deviceId,
-        updateData.tamper
-          ? "Tamper detected"
-          : "Tamper cleared",
+        updateData.tamper ? "Tamper detected" : "Tamper cleared",
         "tamper",
       );
     }
 
     console.log("📡 UPDATE:", deviceId, updateData);
-    // ================= CHECK OWNER ALARM =================
-    const ownerAlarmSnap = await db
-      .ref(`accounts/${uid}/homes/${homeId}/alarm`)
-      .once("value");
 
-    const ownerAlarm = ownerAlarmSnap.val() || {};
+    // ===== OLD ALARM FORMAT =====
+    const ownerAlarm = homeData.alarm || {};
 
     await processAlarmForUser(
       uid,
@@ -516,11 +667,18 @@ client.on("message", async (topic, msg) => {
       updateData,
     );
 
-    // ================= CHECK SHARED USERS =================
-    const sharedSnap = await db
-      .ref(`sharedByHome/${homeId}`)
-      .once("value");
+    // ===== NEW MULTI ALARM FORMAT =====
+    await processScheduleAlarmsForOwner(
+      uid,
+      homeId,
+      homeName,
+      deviceName,
+      homeData,
+      updateData,
+    );
 
+    // ===== SHARED USERS OLD ALARM FORMAT =====
+    const sharedSnap = await db.ref(`sharedByHome/${homeId}`).once("value");
     const sharedMap = sharedSnap.val() || {};
 
     for (const sharedUid of Object.keys(sharedMap)) {
