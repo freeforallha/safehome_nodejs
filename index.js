@@ -148,11 +148,12 @@ function setPermitJoin(enable, time = 60) {
 }
 
 // ================= PUSH =================
-async function sendScheduledNotification(uid, homeId, text) {
+async function sendScheduledNotification(uid, homeId, text, isSafe, reason = "") {
   try {
     const now = Date.now();
     const key = `${uid}_${homeId}_${text}_${getCurrentHHMM()}`;
-    // chống spam trong 55 phút
+
+    // chống spam trong 70 giây
     if (
       lastNotificationMap[key] &&
       now - lastNotificationMap[key] < 70 * 1000
@@ -173,15 +174,14 @@ async function sendScheduledNotification(uid, homeId, text) {
     await admin.messaging().send({
       token,
 
-      notification: {
-        title: "🏡 SAFEHOME",
-        body: text,
-      },
-
       data: {
         type: "schedule_notification",
+        title: "🏡 SAFEHOME",
+        body: text || "",
         homeId: homeId || "",
         uid: uid || "",
+        isSafe: isSafe ? "true" : "false",
+        reason: reason || "",
         clickAction: "schedule_SCREEN",
       },
 
@@ -224,13 +224,10 @@ async function sendAlarm(uid, homeId, reason) {
     await admin.messaging().send({
       token,
 
-      notification: {
-        title: "🚨 SAFEHOME",
-        body: reason || "Có cảnh báo!",
-      },
-
       data: {
         type: "alarm",
+        title: "🚨 SAFEHOME",
+        body: reason || "Có cảnh báo!",
         homeId: homeId || "",
         uid: uid || "",
         clickAction: "alarm_SCREEN",
@@ -290,6 +287,8 @@ async function checkScheduledNotifications() {
               uid,
               homeId,
               "Nhà bạn đã an toàn, hãy an tâm đi ngủ.",
+              true,
+              ""
             );
           } else {
             const detail = safety.unsafeDevices.slice(0, 3).join(", ");
@@ -298,6 +297,8 @@ async function checkScheduledNotifications() {
               uid,
               homeId,
               `⚠️ Nhà ${homeName} chưa an toàn: ${detail}`,
+              false,
+              detail
             );
           }
         }
@@ -738,7 +739,7 @@ client.on("message", async (topic, msg) => {
     }
 
     console.log("📡 UPDATE:", deviceId, updateData);
-    
+
     // ===== NEW MULTI ALARM FORMAT =====
     await processScheduleAlarmsForOwner(
       uid,
