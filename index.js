@@ -7,6 +7,7 @@ const crypto = require("crypto");
 const lastHeartbeatMap = {};
 const lastAlarmMap = {};
 const lastNotificationMap = {};
+const lastScheduleAlarmMap = {};
 
 function getPiSerial() {
   try {
@@ -150,11 +151,11 @@ function setPermitJoin(enable, time = 60) {
 async function sendScheduledNotification(uid, homeId, text) {
   try {
     const now = Date.now();
-const key = `${uid}_${homeId}_${text}_${getCurrentHHMM()}`;
+    const key = `${uid}_${homeId}_${text}_${getCurrentHHMM()}`;
     // chống spam trong 55 phút
     if (
       lastNotificationMap[key] &&
-      now - lastNotificationMap[key] <70* 1000
+      now - lastNotificationMap[key] < 70 * 1000
     ) {
       return;
     }
@@ -419,7 +420,89 @@ async function processScheduleAlarmsForOwner(
     }
   }
 }
+async function checkScheduledAlarms() {
+  try {
+    const snap = await db.ref("accounts").once("value");
+    const accounts = snap.val() || {};
 
+    for (const [uid, user] of Object.entries(accounts)) {
+      const homes = user.homes || {};
+
+      for (const [homeId, home] of Object.entries(homes)) {
+        const schedules = home.schedules || {};
+        const alarmsRaw = schedules.alarms || {};
+
+        const alarms = Array.isArray(alarmsRaw)
+          ? alarmsRaw
+          : Object.values(alarmsRaw);
+
+        const safety = getHomeSafety(home);
+
+        if (safety.safe) {
+          continue;
+        }
+
+        for (const alarm of alarms) {
+          if (!alarm || alarm.enabled !== true) {
+            continue;
+          }
+
+          if (!isNowInRange(alarm.start, alarm.end)) {
+            continue;
+          }
+
+          const detail = safety.unsafeDevices
+            .slice(0, 3)
+            .join(", ");
+
+          const repeatMinutes =
+            parseInt(alarm.repeatMinutes || 0);
+
+          const repeatKey =
+            `${uid}_${homeId}_${alarm.start}_${alarm.end}`;
+
+          const now = Date.now();
+
+          if (repeatMinutes > 0) {
+            const lastTime = lastScheduleAlarmMap[repeatKey] || 0;
+
+            if (
+              now - lastTime <
+              repeatMinutes * 60 * 1000
+            ) {
+              continue;
+            }
+
+            lastScheduleAlarmMap[repeatKey] = now;
+          }
+
+          if (repeatMinutes === 0) {
+            const todayKey =
+              repeatKey +
+              "_" +
+              new Date().toDateString();
+
+            if (lastScheduleAlarmMap[todayKey]) {
+              continue;
+            }
+
+            lastScheduleAlarmMap[todayKey] = now;
+          }
+
+          await sendAlarm(
+            uid,
+            homeId,
+            `⚠️ Nhà ${home.name || homeId} chưa an toàn: ${detail}`,
+          );
+
+          break;
+        }
+      }
+    }
+  } catch (err) {
+    console.log("ALARM CHECK ERROR:", err.message);
+  }
+}
 // ================= INIT =================
 async function init() {
   startDeviceMapListener();
@@ -428,6 +511,7 @@ async function init() {
   console.log("🧹 OLD PAIR REQUESTS CLEARED");
 
   setInterval(checkScheduledNotifications, 60000);
+  setInterval(checkScheduledAlarms, 60000);
 }
 
 init();
@@ -654,19 +738,7 @@ client.on("message", async (topic, msg) => {
     }
 
     console.log("📡 UPDATE:", deviceId, updateData);
-
-    // ===== OLD ALARM FORMAT =====
-    const ownerAlarm = homeData.alarm || {};
-
-    await processAlarmForUser(
-      uid,
-      homeId,
-      homeName,
-      deviceName,
-      ownerAlarm,
-      updateData,
-    );
-
+    
     // ===== NEW MULTI ALARM FORMAT =====
     await processScheduleAlarmsForOwner(
       uid,
