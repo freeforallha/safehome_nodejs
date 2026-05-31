@@ -189,7 +189,9 @@ async function sendScheduledNotification(uid, homeId, text, isSafe, reason = "")
         priority: "high",
 
         notification: {
-          channelId: "schedule_channel",
+          title: "🏡 SafeHome",
+          body: text || "Nhắc nhở SafeHome",
+          channelId: "safehome_schedule_fullscreen_channel",
           priority: "max",
         },
       },
@@ -235,12 +237,6 @@ async function sendAlarm(uid, homeId, reason) {
 
       android: {
         priority: "high",
-
-        notification: {
-          channelId: "alarm_channel",
-          sound: "default",
-          priority: "max",
-        },
       },
     });
 
@@ -426,6 +422,9 @@ async function checkScheduledAlarms() {
     const snap = await db.ref("accounts").once("value");
     const accounts = snap.val() || {};
 
+    const now = Date.now();
+    const today = new Date().toDateString();
+
     for (const [uid, user] of Object.entries(accounts)) {
       const homes = user.homes || {};
 
@@ -452,43 +451,26 @@ async function checkScheduledAlarms() {
             continue;
           }
 
-          const detail = safety.unsafeDevices
-            .slice(0, 3)
-            .join(", ");
+          const repeatMinutes = parseInt(alarm.repeatMinutes || 0);
+          const alarmKey = `${uid}_${homeId}_${alarm.start}_${alarm.end}_${today}`;
 
-          const repeatMinutes =
-            parseInt(alarm.repeatMinutes || 0);
+          const lastTime = lastScheduleAlarmMap[alarmKey] || 0;
 
-          const repeatKey =
-            `${uid}_${homeId}_${alarm.start}_${alarm.end}`;
-
-          const now = Date.now();
-
-          if (repeatMinutes > 0) {
-            const lastTime = lastScheduleAlarmMap[repeatKey] || 0;
-
-            if (
-              now - lastTime <
-              repeatMinutes * 60 * 1000
-            ) {
-              continue;
-            }
-
-            lastScheduleAlarmMap[repeatKey] = now;
+          if (repeatMinutes === 0 && lastTime > 0) {
+            continue;
           }
 
-          if (repeatMinutes === 0) {
-            const todayKey =
-              repeatKey +
-              "_" +
-              new Date().toDateString();
-
-            if (lastScheduleAlarmMap[todayKey]) {
-              continue;
-            }
-
-            lastScheduleAlarmMap[todayKey] = now;
+          if (
+            repeatMinutes > 0 &&
+            lastTime > 0 &&
+            now - lastTime < repeatMinutes * 60 * 1000
+          ) {
+            continue;
           }
+
+          lastScheduleAlarmMap[alarmKey] = now;
+
+          const detail = safety.unsafeDevices.slice(0, 3).join(", ");
 
           await sendAlarm(
             uid,
@@ -512,7 +494,8 @@ async function init() {
   console.log("🧹 OLD PAIR REQUESTS CLEARED");
 
   setInterval(checkScheduledNotifications, 60000);
-  setInterval(checkScheduledAlarms, 60000);
+  // Tạm tắt alarm lặp tự động.
+  // Alarm chỉ nổ khi sensor có event mới.
 }
 
 init();
