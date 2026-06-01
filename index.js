@@ -8,6 +8,8 @@ const lastHeartbeatMap = {};
 const lastAlarmMap = {};
 const lastNotificationMap = {};
 const lastScheduleAlarmMap = {};
+const pendingEventAlarmMap = {};
+const pendingEventAlarmTimerMap = {};
 
 function getPiSerial() {
   try {
@@ -87,6 +89,19 @@ function isNowInRange(startTime, endTime) {
   }
 
   return nowMin >= start && nowMin <= end;
+}
+function getNextAlarmTimeText(repeatMinutes) {
+  const minutes = parseInt(repeatMinutes || 0);
+
+  if (minutes <= 0) {
+    return "không lặp lại";
+  }
+
+  const next = new Date(Date.now() + minutes * 60 * 1000);
+  const hh = next.getHours().toString().padStart(2, "0");
+  const mm = next.getMinutes().toString().padStart(2, "0");
+
+  return `${hh}:${mm}`;
 }
 function getHomeSafety(home) {
   const devices = home.devices || {};
@@ -202,7 +217,20 @@ async function sendScheduledNotification(uid, homeId, text, isSafe, reason = "")
     console.log("NOTIFICATION SEND ERROR:", err.message);
   }
 }
+async function canReceiveAlarm(uid, homeId) {
+  try {
+    const snap = await db
+      .ref(`accounts/${uid}/alarmSettings/${homeId}/enabled`)
+      .once("value");
 
+    const enabled = snap.val();
+
+    return enabled !== false;
+  } catch (err) {
+    console.log("ALARM SETTING CHECK ERROR:", err.message);
+    return true;
+  }
+}
 async function sendAlarm(uid, homeId, reason) {
   try {
     const now = Date.now();
@@ -214,7 +242,12 @@ async function sendAlarm(uid, homeId, reason) {
     }
 
     lastAlarmMap[key] = now;
+    const enabled = await canReceiveAlarm(uid, homeId);
 
+    if (!enabled) {
+      console.log("🔕 ALARM MUTED BY USER:", uid, homeId);
+      return;
+    }
     const snap = await db.ref(`accounts/${uid}/fcmToken`).once("value");
     const token = snap.val();
 
@@ -245,7 +278,96 @@ async function sendAlarm(uid, homeId, reason) {
     console.log("FCM ERROR:", err.message);
   }
 }
+async function sendAlarmSummary(uid, items) {
+  try {
+    if (!items || items.length === 0) {
+      return;
+    }
+    const uniqueItems = [];
 
+    for (const item of items) {
+      const exists = uniqueItems.some((oldItem) => {
+        return oldItem.homeId === item.homeId && oldItem.reason === item.reason;
+      });
+
+      if (!exists) {
+        uniqueItems.push(item);
+      }
+    }
+
+    items = uniqueItems;
+    const firstHomeId = items[0].homeId;
+
+    const enabled = await canReceiveAlarm(uid, firstHomeId);
+
+    if (!enabled) {
+      console.log("🔕 ALARM SUMMARY MUTED BY USER:", uid, firstHomeId);
+      return;
+    }
+
+    const snap = await db.ref(`accounts/${uid}/fcmToken`).once("value");
+    const token = snap.val();
+
+    if (!token) {
+      console.log("❌ NO TOKEN FOR ALARM SUMMARY:", uid);
+      return;
+    }
+
+    const lines = items.slice(0, 4).map((item) => {
+      return `${item.homeName}: ${item.reason}`;
+    });
+
+    if (items.length > 4) {
+      lines.push("...");
+    }
+
+    await admin.messaging().send({
+      token,
+
+      data: {
+        type: "alarm",
+        title: "🚨 SAFEHOME",
+        body: lines.join("\n"),
+        alarmItems: JSON.stringify(items),
+        clickAction: "alarm_SCREEN",
+      },
+
+      android: {
+        priority: "high",
+      },
+    });
+
+    console.log("🚨 SUMMARY PUSH SENT:", uid, items.length);
+  } catch (err) {
+    console.log("SUMMARY ALARM ERROR:", err.message);
+  }
+}
+function queueEventAlarm(uid, item) {
+  if (!pendingEventAlarmMap[uid]) {
+    pendingEventAlarmMap[uid] = [];
+  }
+
+  const exists = pendingEventAlarmMap[uid].some((oldItem) => {
+    return oldItem.homeId === item.homeId && oldItem.reason === item.reason;
+  });
+
+  if (!exists) {
+    pendingEventAlarmMap[uid].push(item);
+  }
+
+  if (pendingEventAlarmTimerMap[uid]) {
+    return;
+  }
+
+  pendingEventAlarmTimerMap[uid] = setTimeout(async () => {
+    const items = pendingEventAlarmMap[uid] || [];
+
+    delete pendingEventAlarmMap[uid];
+    delete pendingEventAlarmTimerMap[uid];
+
+    await sendAlarmSummary(uid, items);
+  }, 1200);
+}
 // ================= SCHEDULE CHECK =================
 async function checkScheduledNotifications() {
   try {
@@ -349,36 +471,6 @@ async function addDeviceNotification(
 }
 
 // ================= ALARM LOGIC =================
-async function processAlarmForUser(
-  uid,
-  homeId,
-  homeName,
-  deviceName,
-  alarm,
-  updateData,
-) {
-  if (!alarm || alarm.enabled !== true) return;
-
-  const inTime = isNowInRange(alarm.start || "23:00", alarm.end || "06:00");
-
-  if (!inTime) return;
-
-  if (updateData.status && updateData.status !== "closed") {
-    await sendAlarm(
-      uid,
-      homeId,
-      `Nhà ${homeName} - ${deviceName}: Cửa mở bất thường`,
-    );
-  }
-
-  if (updateData.tamper === true) {
-    await sendAlarm(
-      uid,
-      homeId,
-      `Nhà ${homeName} - ${deviceName}: Thiết bị bị tháo`,
-    );
-  }
-}
 
 async function processScheduleAlarmsForOwner(
   uid,
@@ -399,25 +491,31 @@ async function processScheduleAlarmsForOwner(
     if (!inTime) continue;
 
     if (updateData.status && updateData.status !== "closed") {
-      await sendAlarm(
-        uid,
+      queueEventAlarm(uid, {
         homeId,
-        `Nhà ${homeName} - ${deviceName}: Cửa mở bất thường`,
-      );
+        homeName,
+        reason: `${deviceName}: Cửa mở bất thường`,
+        repeatMinutes: 0,
+        nextAlarm: "theo lịch alarm đã cài",
+      });
       return;
     }
 
     if (updateData.tamper === true) {
-      await sendAlarm(
-        uid,
+      queueEventAlarm(uid, {
         homeId,
-        `Nhà ${homeName} - ${deviceName}: Thiết bị bị tháo`,
-      );
+        homeName,
+        reason: `${deviceName}: Thiết bị bị tháo`,
+        repeatMinutes: 0,
+        nextAlarm: "theo lịch alarm đã cài",
+      });
       return;
     }
   }
 }
 async function checkScheduledAlarms() {
+  console.log("🚨 CHECK ALARM SCHEDULE");
+
   try {
     const snap = await db.ref("accounts").once("value");
     const accounts = snap.val() || {};
@@ -425,10 +523,53 @@ async function checkScheduledAlarms() {
     const now = Date.now();
     const today = new Date().toDateString();
 
-    for (const [uid, user] of Object.entries(accounts)) {
-      const homes = user.homes || {};
+    const alarmSummaryByUser = {};
 
-      for (const [homeId, home] of Object.entries(homes)) {
+    for (const [uid, user] of Object.entries(accounts)) {
+      const ownHomes = user.homes || {};
+      const sharedHomes = user.sharedHomes || {};
+
+      const homesToCheck = [];
+
+      for (const [homeId, home] of Object.entries(ownHomes)) {
+        homesToCheck.push({
+          receiverUid: uid,
+          ownerUid: uid,
+          homeId,
+          home,
+          source: "owner",
+        });
+      }
+
+      for (const [homeId, sharedInfo] of Object.entries(sharedHomes)) {
+        const ownerUid = sharedInfo?.ownerUid;
+        if (!ownerUid) continue;
+
+        const homeSnap = await db
+          .ref(`accounts/${ownerUid}/homes/${homeId}`)
+          .once("value");
+
+        const sharedHome = homeSnap.val();
+        if (!sharedHome) continue;
+
+        homesToCheck.push({
+          receiverUid: uid,
+          ownerUid,
+          homeId,
+          home: sharedHome,
+          source: "shared",
+        });
+      }
+
+      for (const item of homesToCheck) {
+        const { receiverUid, ownerUid, homeId, home, source } = item;
+
+        const canReceive = await canReceiveAlarm(receiverUid, homeId);
+        if (!canReceive) {
+          console.log("🔕 ALARM MUTED BY USER:", receiverUid, homeId);
+          continue;
+        }
+
         const schedules = home.schedules || {};
         const alarmsRaw = schedules.alarms || {};
 
@@ -438,27 +579,25 @@ async function checkScheduledAlarms() {
 
         const safety = getHomeSafety(home);
 
-        if (safety.safe) {
-          continue;
-        }
+        console.log("🚨 ALARM HOME:", receiverUid, homeId, {
+          ownerUid,
+          source,
+          safe: safety.safe,
+          unsafeDevices: safety.unsafeDevices,
+          alarms,
+        });
+
+        if (safety.safe) continue;
 
         for (const alarm of alarms) {
-          if (!alarm || alarm.enabled !== true) {
-            continue;
-          }
-
-          if (!isNowInRange(alarm.start, alarm.end)) {
-            continue;
-          }
+          if (!alarm || alarm.enabled !== true) continue;
+          if (!isNowInRange(alarm.start, alarm.end)) continue;
 
           const repeatMinutes = parseInt(alarm.repeatMinutes || 0);
-          const alarmKey = `${uid}_${homeId}_${alarm.start}_${alarm.end}_${today}`;
-
+          const alarmKey = `${receiverUid}_${ownerUid}_${homeId}_${alarm.start}_${alarm.end}_${today}`;
           const lastTime = lastScheduleAlarmMap[alarmKey] || 0;
 
-          if (repeatMinutes === 0 && lastTime > 0) {
-            continue;
-          }
+          if (repeatMinutes === 0 && lastTime > 0) continue;
 
           if (
             repeatMinutes > 0 &&
@@ -472,15 +611,25 @@ async function checkScheduledAlarms() {
 
           const detail = safety.unsafeDevices.slice(0, 3).join(", ");
 
-          await sendAlarm(
-            uid,
+          if (!alarmSummaryByUser[receiverUid]) {
+            alarmSummaryByUser[receiverUid] = [];
+          }
+
+          alarmSummaryByUser[receiverUid].push({
             homeId,
-            `⚠️ Nhà ${home.name || homeId} chưa an toàn: ${detail}`,
-          );
+            homeName: home.name || homeId,
+            reason: detail,
+            repeatMinutes,
+            nextAlarm: getNextAlarmTimeText(repeatMinutes),
+          });
 
           break;
         }
       }
+    }
+
+    for (const [receiverUid, items] of Object.entries(alarmSummaryByUser)) {
+      await sendAlarmSummary(receiverUid, items);
     }
   } catch (err) {
     console.log("ALARM CHECK ERROR:", err.message);
@@ -494,8 +643,7 @@ async function init() {
   console.log("🧹 OLD PAIR REQUESTS CLEARED");
 
   setInterval(checkScheduledNotifications, 60000);
-  // Tạm tắt alarm lặp tự động.
-  // Alarm chỉ nổ khi sensor có event mới.
+  setInterval(checkScheduledAlarms, 60000);
 }
 
 init();
@@ -733,23 +881,28 @@ client.on("message", async (topic, msg) => {
       updateData,
     );
 
-    // ===== SHARED USERS OLD ALARM FORMAT =====
+    // ===== SHARED USERS ALARM FROM OWNER HOME SCHEDULE =====
     const sharedSnap = await db.ref(`sharedByHome/${homeId}`).once("value");
     const sharedMap = sharedSnap.val() || {};
+    console.log("🚨 SHARED ALARM USERS:", homeId, sharedMap);
 
     for (const sharedUid of Object.keys(sharedMap)) {
-      const sharedAlarmSnap = await db
-        .ref(`accounts/${sharedUid}/sharedHomes/${homeId}/alarm`)
+      const sharedHomeSnap = await db
+        .ref(`accounts/${sharedUid}/sharedHomes/${homeId}`)
         .once("value");
 
-      const sharedAlarm = sharedAlarmSnap.val() || {};
+      const sharedHomeInfo = sharedHomeSnap.val() || {};
 
-      await processAlarmForUser(
+      if (sharedHomeInfo.alarmEnabled === false) {
+        continue;
+      }
+
+      await processScheduleAlarmsForOwner(
         sharedUid,
         homeId,
         homeName,
         deviceName,
-        sharedAlarm,
+        homeData,
         updateData,
       );
     }
