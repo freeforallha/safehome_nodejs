@@ -109,13 +109,41 @@ function getHomeSafety(home) {
 
   for (const [deviceId, device] of Object.entries(devices)) {
     const name = device.name || deviceId;
+    const type = device.type || "door";
 
-    if (device.status !== "closed") {
-      unsafeDevices.push(`${name} đang mở`);
+    if (type === "door") {
+      if (device.contact === false) {
+        unsafeDevices.push(`${name} đang mở`);
+      }
+
+      if (device.tamper === true) {
+        unsafeDevices.push(`${name} bị tháo`);
+      }
+
+      continue;
     }
 
-    if (device.tamper === true) {
-      unsafeDevices.push(`${name} bị tháo`);
+    if (type === "smoke") {
+      if (device.smoke === true) {
+        unsafeDevices.push(`${name} phát hiện khói`);
+      }
+
+      if (device.tamper === true) {
+        unsafeDevices.push(`${name} bị tháo`);
+      }
+
+      continue;
+    }
+
+    if (type === "sos") {
+      const lastTriggered = Number(device.last_triggered || 0);
+      const isRecentlyTriggered = lastTriggered > 0 && Date.now() - lastTriggered < 60 * 1000;
+
+      if (isRecentlyTriggered) {
+        unsafeDevices.push(`${name} đã kích hoạt SOS`);
+      }
+
+      continue;
     }
   }
 
@@ -123,6 +151,23 @@ function getHomeSafety(home) {
     safe: unsafeDevices.length === 0,
     unsafeDevices,
   };
+}
+function getDeviceTypeFromModel(modelId, description, ieee) {
+  const id = (ieee || "").toLowerCase();
+  const model = (modelId || "").toLowerCase();
+  const desc = (description || "").toLowerCase();
+
+  if (id === "0xa4c1388295d25926") return "smoke";
+  if (id === "0xa4c138b872c891a2") return "temperature";
+  if (id === "0xa4c1381162d4d15b") return "sos";
+  if (id === "0xa4c13898b084dbdc") return "repeater";
+
+  if (desc.includes("smoke") || model.includes("ts0205")) return "smoke";
+  if (desc.includes("temperature") || desc.includes("humidity")) return "temperature";
+  if (desc.includes("sos") || desc.includes("button")) return "sos";
+  if (desc.includes("repeater") || model.includes("ts0207")) return "repeater";
+
+  return "door";
 }
 // ================= DEVICE LISTENER =================
 function startDeviceMapListener() {
@@ -144,8 +189,7 @@ function startDeviceMapListener() {
 
     deviceMap = newMap;
 
-    console.log("🔄 DEVICE MAP:", Object.keys(deviceMap).length);
-  });
+// console.log("🔄 DEVICE MAP:", Object.keys(deviceMap).length);  });
 }
 
 // ================= PERMIT JOIN =================
@@ -490,7 +534,7 @@ async function processScheduleAlarmsForOwner(
 
     if (!inTime) continue;
 
-    if (updateData.status && updateData.status !== "closed") {
+    if (updateData.contact === false) {
       queueEventAlarm(uid, {
         homeId,
         homeName,
@@ -744,15 +788,68 @@ client.on("message", async (topic, msg) => {
           }
         }
 
-        await db.ref(`accounts/${uid}/homes/${homeId}/devices/${ieee}`).set({
-          name: payload.friendly_name || ieee,
+        const deviceType = getDeviceTypeFromModel(
+          payload?.definition?.model,
+          payload?.definition?.description,
           ieee,
-          status: "unknown",
+        );
+        let defaultName = "Thiết bị";
+
+        const devicesSnap = await db
+          .ref(`accounts/${uid}/homes/${homeId}/devices`)
+          .once("value");
+
+        const devices = devicesSnap.val() || {};
+
+        const sameTypeCount = Object.values(devices).filter((d) => {
+          return d?.type === deviceType;
+        }).length + 1;
+
+        switch (deviceType) {
+          case "door":
+            defaultName = `Cửa ${sameTypeCount}`;
+            break;
+
+          case "smoke":
+            defaultName = `Báo cháy ${sameTypeCount}`;
+            break;
+
+          case "temperature":
+            defaultName = `Nhiệt độ ${sameTypeCount}`;
+            break;
+
+          case "sos":
+            defaultName = `SOS ${sameTypeCount}`;
+            break;
+
+          case "repeater":
+            defaultName = `Bộ mở rộng sóng ${sameTypeCount}`;
+            break;
+
+          default:
+            defaultName = `Thiết bị ${sameTypeCount}`;
+        }
+        await db.ref(`accounts/${uid}/homes/${homeId}/devices/${ieee}`).set({
+          name: defaultName,
+          ieee,
+          type: deviceType,
+
+          availability: "unknown",
+          last_seen: null,
+
+          battery: null,
+          linkquality: null,
+
+          contact: null,
+          smoke: null,
           tamper: false,
-          battery: 100,
-          last_seen: Date.now(),
-          last_event: Date.now(),
+          temperature: null,
+          humidity: null,
+          action: null,
+
+          last_event: null,
           created: Date.now(),
+          updated_at: Date.now(),
         });
 
         await db.ref(`system/devices_by_ieee/${ieee}`).set({
@@ -773,8 +870,36 @@ client.on("message", async (topic, msg) => {
     // ===== SENSOR UPDATE =====
     if (!topic.startsWith("zigbee2mqtt/")) return;
 
-    const deviceId = topic.replace("zigbee2mqtt/", "");
-    if (deviceId.startsWith("bridge")) return;
+    const rawTopic = topic.replace("zigbee2mqtt/", "");
+    if (rawTopic.startsWith("bridge")) return;
+
+    const topicParts = rawTopic.split("/");
+    const deviceId = topicParts[0];
+    const subTopic = topicParts[1] || null;
+
+    if (subTopic === "availability") {
+      const availabilityValue =
+        typeof data === "string"
+          ? data
+          : data.state || data.availability || data.status || null;
+
+      if (!availabilityValue) return;
+
+      const map = deviceMap[deviceId];
+      if (!map) return;
+
+      const { uid, homeId } = map;
+
+      await db
+        .ref(`accounts/${uid}/homes/${homeId}/devices/${deviceId}`)
+        .update({
+          availability: availabilityValue,
+          updated_at: Date.now(),
+        });
+
+      console.log("📶 AVAILABILITY:", deviceId, availabilityValue);
+      return;
+    }
 
     const map = deviceMap[deviceId];
     if (!map) return;
@@ -796,32 +921,26 @@ client.on("message", async (topic, msg) => {
     const homeData = homeSnap.val() || {};
     const homeName = homeData.name || homeId;
 
-    const oldStatus = oldData.status;
     const oldTamper = oldData.tamper;
 
     const now = Date.now();
 
     let updateData = {};
-
-    if (data.linkquality !== undefined) {
-      updateData.linkquality = data.linkquality;
-
-      if (data.linkquality < 50) {
-        updateData.signal_status = "weak";
-      } else if (data.linkquality < 100) {
-        updateData.signal_status = "medium";
-      } else {
-        updateData.signal_status = "strong";
-      }
+    updateData.updated_at = now;
+    if (data.availability !== undefined) {
+      updateData.availability = data.availability;
     }
 
-    updateData.last_seen_text = formatDateTime(now);
-
+    if (data.last_seen !== undefined) {
+      updateData.last_seen = data.last_seen;
+    }
+    if (data.linkquality !== undefined) {
+      updateData.linkquality = data.linkquality;
+    }
     if (data.contact !== undefined) {
-      const newStatus = data.contact ? "closed" : "open";
-      updateData.status = newStatus;
+      updateData.contact = data.contact;
 
-      if (newStatus !== oldStatus) {
+      if (data.contact !== oldData.contact) {
         updateData.last_event = now;
       }
     }
@@ -838,23 +957,60 @@ client.on("message", async (topic, msg) => {
     if (data.battery !== undefined) {
       updateData.battery = data.battery;
     }
+    if (data.smoke !== undefined) {
+      updateData.type = "smoke";
+      updateData.smoke = data.smoke;
 
-    const hasEvent =
-      (data.contact !== undefined && updateData.status !== oldStatus) ||
-      (data.tamper !== undefined && updateData.tamper !== oldTamper);
-
-    if (!hasEvent) {
-      updateData.last_seen = now;
+      if (data.smoke !== oldData.smoke) {
+        updateData.last_event = now;
+      }
     }
+
+    if (data.temperature !== undefined) {
+      updateData.type = "temperature";
+      updateData.temperature = data.temperature;
+    }
+
+    if (data.humidity !== undefined) {
+      updateData.type = "temperature";
+      updateData.humidity = data.humidity;
+    }
+
+    if (data.action !== undefined) {
+      updateData.type = "sos";
+      updateData.action = data.action;
+      updateData.last_event = now;
+      updateData.last_triggered = now;
+    }
+
 
     await deviceRef.update(updateData);
 
-    if (updateData.status !== undefined && updateData.status !== oldStatus) {
+
+    if (updateData.last_event !== undefined) {
+      let statusText = "";
+
+      const currentType = updateData.type || oldData.type || "door";
+
+      if (currentType === "door") {
+        statusText = updateData.contact === false ? "Cửa mở" : "Cửa đóng";
+      } else if (currentType === "smoke") {
+        statusText = updateData.smoke === true ? "Phát hiện khói" : "Khói đã trở lại bình thường";
+      } else if (currentType === "sos") {
+        statusText = "Nút SOS đã được bấm";
+      } else if (currentType === "temperature") {
+        statusText = "Cập nhật nhiệt độ / độ ẩm";
+      } else if (currentType === "repeater") {
+        statusText = "Bộ mở rộng sóng đã cập nhật trạng thái";
+      } else {
+        statusText = "Thiết bị đã cập nhật trạng thái";
+      }
+
       await addDeviceNotification(
         uid,
         homeId,
         deviceId,
-        updateData.status === "open" ? "Door opened" : "Door closed",
+        statusText,
         "status",
       );
     }
