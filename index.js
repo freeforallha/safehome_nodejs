@@ -123,17 +123,10 @@ function getHomeSafety(home) {
       continue;
     }
 
-    if (type === "smoke") {
-      if (device.smoke === true) {
-        unsafeDevices.push(`${name} phát hiện khói`);
-      }
-
-      if (device.tamper === true) {
-        unsafeDevices.push(`${name} bị tháo`);
-      }
-
-      continue;
-    }
+    // smoke và sos không tham gia alarm theo lịch
+    // chúng đã được xử lý bằng emergency alarm realtime
+    if (type === "smoke") continue;
+    if (type === "sos") continue;
 
     if (type === "sos") {
       const lastTriggered = Number(device.last_triggered || 0);
@@ -143,6 +136,41 @@ function getHomeSafety(home) {
         unsafeDevices.push(`${name} đã kích hoạt SOS`);
       }
 
+      continue;
+    }
+  }
+
+  return {
+    safe: unsafeDevices.length === 0,
+    unsafeDevices,
+  };
+}
+function getHomeNotificationSafety(home) {
+  const devices = home.devices || {};
+  const unsafeDevices = [];
+
+  for (const [deviceId, device] of Object.entries(devices)) {
+    const name = device.name || deviceId;
+    const type = device.type || "door";
+
+    if (type === "door") {
+      if (device.contact === false) unsafeDevices.push(`${name} đang mở`);
+      if (device.tamper === true) unsafeDevices.push(`${name} bị tháo`);
+      continue;
+    }
+
+    if (type === "smoke") {
+      if (device.smoke === true) unsafeDevices.push(`${name} phát hiện khói`);
+      if (device.tamper === true) unsafeDevices.push(`${name} bị tháo`);
+      continue;
+    }
+
+    if (type === "sos") {
+      const lastTriggered = Number(device.last_triggered || 0);
+      const isRecentlyTriggered =
+        lastTriggered > 0 && Date.now() - lastTriggered < 60 * 1000;
+
+      if (isRecentlyTriggered) unsafeDevices.push(`${name} đã kích hoạt SOS`);
       continue;
     }
   }
@@ -443,7 +471,7 @@ async function checkScheduledNotifications() {
           }
 
           const homeName = home.name || homeId;
-          const safety = getHomeSafety(home);
+          const safety = getHomeNotificationSafety(home);
 
           if (safety.safe) {
             await sendScheduledNotification(
@@ -522,12 +550,58 @@ async function processScheduleAlarmsForOwner(
   homeId,
   homeName,
   deviceName,
+  deviceType,
   homeData,
   updateData,
 ) {
   const schedules = homeData.schedules || {};
   const alarms = schedules.alarms || [];
+  const isSecurityDevice =
+    deviceType === "door" ||
+    deviceType === "door_lock" ||
+    deviceType === "motion";
 
+  const isEmergencyDevice =
+    deviceType === "smoke" ||
+    deviceType === "gas" ||
+    deviceType === "water_leak" ||
+    deviceType === "sos";
+
+  // các loại khác không kích hoạt alarm
+  if (isEmergencyDevice) {
+    if (updateData.smoke === true) {
+      queueEventAlarm(uid, {
+        homeId,
+        homeName,
+        reason: `${deviceName}: Phát hiện khói`,
+        repeatMinutes: 0,
+        nextAlarm: "ngay lập tức",
+      });
+      return;
+    }
+
+    if (updateData.action !== undefined) {
+      queueEventAlarm(uid, {
+        homeId,
+        homeName,
+        reason: `${deviceName}: SOS được kích hoạt`,
+        repeatMinutes: 0,
+        nextAlarm: "ngay lập tức",
+      });
+      return;
+    }
+
+    if (updateData.tamper === true) {
+      queueEventAlarm(uid, {
+        homeId,
+        homeName,
+        reason: `${deviceName}: Thiết bị bị tháo`,
+        repeatMinutes: 0,
+        nextAlarm: "ngay lập tức",
+      });
+      return;
+    }
+  }
   for (const item of alarms) {
     if (!item || item.enabled !== true) continue;
 
@@ -1036,11 +1110,13 @@ client.on("message", async (topic, msg) => {
     console.log("📡 UPDATE:", deviceId, updateData);
 
     // ===== NEW MULTI ALARM FORMAT =====
+    // ===== NEW MULTI ALARM FORMAT =====
     await processScheduleAlarmsForOwner(
       uid,
       homeId,
       homeName,
       deviceName,
+      updateData.type || oldData.type || "door",
       homeData,
       updateData,
     );
@@ -1066,6 +1142,7 @@ client.on("message", async (topic, msg) => {
         homeId,
         homeName,
         deviceName,
+        updateData.type || oldData.type || "door",
         homeData,
         updateData,
       );
