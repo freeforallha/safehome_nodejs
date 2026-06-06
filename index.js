@@ -189,7 +189,8 @@ function startDeviceMapListener() {
 
     deviceMap = newMap;
 
-// console.log("🔄 DEVICE MAP:", Object.keys(deviceMap).length);  });
+    // console.log("🔄 DEVICE MAP:", Object.keys(deviceMap).length); 
+  });
 }
 
 // ================= PERMIT JOIN =================
@@ -956,6 +957,12 @@ client.on("message", async (topic, msg) => {
 
     if (data.battery !== undefined) {
       updateData.battery = data.battery;
+      updateData.battery_status = "percent";
+    }
+
+    if (data.battery_low !== undefined) {
+      updateData.battery_low = data.battery_low;
+      updateData.battery_status = data.battery_low === true ? "low" : "ok";
     }
     if (data.smoke !== undefined) {
       updateData.type = "smoke";
@@ -981,6 +988,7 @@ client.on("message", async (topic, msg) => {
       updateData.action = data.action;
       updateData.last_event = now;
       updateData.last_triggered = now;
+      updateData.sos_active_until = now + 5 * 60 * 1000;
     }
 
 
