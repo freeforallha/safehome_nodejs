@@ -128,16 +128,7 @@ function getHomeSafety(home) {
     if (type === "smoke") continue;
     if (type === "sos") continue;
 
-    if (type === "sos") {
-      const lastTriggered = Number(device.last_triggered || 0);
-      const isRecentlyTriggered = lastTriggered > 0 && Date.now() - lastTriggered < 60 * 1000;
 
-      if (isRecentlyTriggered) {
-        unsafeDevices.push(`${name} đã kích hoạt SOS`);
-      }
-
-      continue;
-    }
   }
 
   return {
@@ -145,24 +136,45 @@ function getHomeSafety(home) {
     unsafeDevices,
   };
 }
-function getHomeNotificationSafety(home) {
+  function getHomeNotificationSafety(home) {
   const devices = home.devices || {};
   const unsafeDevices = [];
 
   for (const [deviceId, device] of Object.entries(devices)) {
     const name = device.name || deviceId;
     const type = device.type || "door";
+    const issues = [];
+
+    const ignoreOfflineTypes = ["temperature", "repeater"];
+
+    const lastSeen = device.last_seen
+      ? new Date(device.last_seen).getTime()
+      : 0;
+
+    const offline =
+      !ignoreOfflineTypes.includes(type) &&
+      (!lastSeen || Date.now() - lastSeen > 2 * 60 * 60 * 1000);
+
+    if (offline) issues.push("mất kết nối");
+
+    const batteryLow =
+      device.battery_low === true ||
+      (
+        device.battery !== undefined &&
+        device.battery !== null &&
+        Number(device.battery) <= 20
+      );
+
+    if (batteryLow) issues.push("pin yếu");
 
     if (type === "door") {
-      if (device.contact === false) unsafeDevices.push(`${name} đang mở`);
-      if (device.tamper === true) unsafeDevices.push(`${name} bị tháo`);
-      continue;
+      if (device.contact === false) issues.push("đang mở");
+      if (device.tamper === true) issues.push("bị tháo");
     }
 
     if (type === "smoke") {
-      if (device.smoke === true) unsafeDevices.push(`${name} phát hiện khói`);
-      if (device.tamper === true) unsafeDevices.push(`${name} bị tháo`);
-      continue;
+      if (device.smoke === true) issues.push("phát hiện khói");
+      if (device.tamper === true) issues.push("bị tháo");
     }
 
     if (type === "sos") {
@@ -170,8 +182,11 @@ function getHomeNotificationSafety(home) {
       const isRecentlyTriggered =
         lastTriggered > 0 && Date.now() - lastTriggered < 60 * 1000;
 
-      if (isRecentlyTriggered) unsafeDevices.push(`${name} đã kích hoạt SOS`);
-      continue;
+      if (isRecentlyTriggered) issues.push("đã kích hoạt SOS");
+    }
+
+    if (issues.length > 0) {
+      unsafeDevices.push(`${name}: ${issues.join(", ")}`);
     }
   }
 
@@ -236,7 +251,7 @@ function setPermitJoin(enable, time = 60) {
 }
 
 // ================= PUSH =================
-async function sendScheduledNotification(uid, homeId, text, isSafe, reason = "") {
+async function sendScheduledNotification(uid, homeId, text, isSafe, reason = "", reminderItems = []) {
   try {
     const now = Date.now();
     const key = `${uid}_${homeId}_${text}_${getCurrentHHMM()}`;
@@ -270,6 +285,7 @@ async function sendScheduledNotification(uid, homeId, text, isSafe, reason = "")
         uid: uid || "",
         isSafe: isSafe ? "true" : "false",
         reason: reason || "",
+        reminderItems: JSON.stringify(reminderItems || []),
         clickAction: "schedule_SCREEN",
       },
 
@@ -461,14 +477,8 @@ async function checkScheduledNotifications() {
           : Object.values(notificationsRaw);
 
         for (const item of notifications) {
-
-          if (!item || item.enabled !== true) {
-            continue;
-          }
-
-          if (item.time !== current) {
-            continue;
-          }
+          if (!item || item.enabled !== true) continue;
+          if (item.time !== current) continue;
 
           const homeName = home.name || homeId;
           const safety = getHomeNotificationSafety(home);
@@ -479,7 +489,14 @@ async function checkScheduledNotifications() {
               homeId,
               "Nhà bạn đã an toàn, hãy an tâm đi ngủ.",
               true,
-              ""
+              "",
+              [
+                {
+                  homeId,
+                  homeName,
+                  reasons: [],
+                },
+              ]
             );
           } else {
             const detail = safety.unsafeDevices.slice(0, 3).join(", ");
@@ -489,7 +506,14 @@ async function checkScheduledNotifications() {
               homeId,
               `⚠️ Nhà ${homeName} chưa an toàn: ${detail}`,
               false,
-              detail
+              detail,
+              [
+                {
+                  homeId,
+                  homeName,
+                  reasons: safety.unsafeDevices,
+                },
+              ]
             );
           }
         }
@@ -549,13 +573,14 @@ async function processScheduleAlarmsForOwner(
   uid,
   homeId,
   homeName,
+  deviceId,
   deviceName,
   deviceType,
   homeData,
   updateData,
 ) {
-  const schedules = homeData.schedules || {};
-  const alarms = schedules.alarms || [];
+  const deviceAlarm =
+    homeData.devices?.[deviceId]?.alarm || null;
   const isSecurityDevice =
     deviceType === "door" ||
     deviceType === "door_lock" ||
@@ -566,7 +591,9 @@ async function processScheduleAlarmsForOwner(
     deviceType === "gas" ||
     deviceType === "water_leak" ||
     deviceType === "sos";
-
+  if (!isSecurityDevice && !isEmergencyDevice) {
+    return;
+  }
   // các loại khác không kích hoạt alarm
   if (isEmergencyDevice) {
     if (updateData.smoke === true) {
@@ -602,34 +629,43 @@ async function processScheduleAlarmsForOwner(
       return;
     }
   }
-  for (const item of alarms) {
-    if (!item || item.enabled !== true) continue;
+  if (!isSecurityDevice) {
+    return;
+  }
 
-    const inTime = isNowInRange(item.start, item.end);
+  if (!deviceAlarm || deviceAlarm.enabled !== true) {
+    return;
+  }
 
-    if (!inTime) continue;
+  const inTime = isNowInRange(
+    deviceAlarm.start,
+    deviceAlarm.end,
+  );
 
-    if (updateData.contact === false) {
-      queueEventAlarm(uid, {
-        homeId,
-        homeName,
-        reason: `${deviceName}: Cửa mở bất thường`,
-        repeatMinutes: 0,
-        nextAlarm: "theo lịch alarm đã cài",
-      });
-      return;
-    }
+  if (!inTime) {
+    return;
+  }
 
-    if (updateData.tamper === true) {
-      queueEventAlarm(uid, {
-        homeId,
-        homeName,
-        reason: `${deviceName}: Thiết bị bị tháo`,
-        repeatMinutes: 0,
-        nextAlarm: "theo lịch alarm đã cài",
-      });
-      return;
-    }
+  if (updateData.contact === false) {
+    queueEventAlarm(uid, {
+      homeId,
+      homeName,
+      reason: `${deviceName}: Cửa mở bất thường`,
+      repeatMinutes: 0,
+      nextAlarm: "theo lịch alarm của thiết bị",
+    });
+    return;
+  }
+
+  if (updateData.tamper === true) {
+    queueEventAlarm(uid, {
+      homeId,
+      homeName,
+      reason: `${deviceName}: Thiết bị bị tháo`,
+      repeatMinutes: 0,
+      nextAlarm: "theo lịch alarm của thiết bị",
+    });
+    return;
   }
 }
 async function checkScheduledAlarms() {
@@ -689,31 +725,33 @@ async function checkScheduledAlarms() {
           continue;
         }
 
-        const schedules = home.schedules || {};
-        const alarmsRaw = schedules.alarms || {};
 
-        const alarms = Array.isArray(alarmsRaw)
-          ? alarmsRaw
-          : Object.values(alarmsRaw);
 
-        const safety = getHomeSafety(home);
+        const devices = home.devices || {};
 
-        console.log("🚨 ALARM HOME:", receiverUid, homeId, {
-          ownerUid,
-          source,
-          safe: safety.safe,
-          unsafeDevices: safety.unsafeDevices,
-          alarms,
-        });
+        for (const [deviceId, device] of Object.entries(devices)) {
+          const deviceType = device.type || "door";
 
-        if (safety.safe) continue;
+          const isSecurityDevice =
+            deviceType === "door" ||
+            deviceType === "door_lock" ||
+            deviceType === "motion";
 
-        for (const alarm of alarms) {
-          if (!alarm || alarm.enabled !== true) continue;
-          if (!isNowInRange(alarm.start, alarm.end)) continue;
+          if (!isSecurityDevice) continue;
 
-          const repeatMinutes = parseInt(alarm.repeatMinutes || 0);
-          const alarmKey = `${receiverUid}_${ownerUid}_${homeId}_${alarm.start}_${alarm.end}_${today}`;
+          const deviceAlarm = device.alarm;
+
+          if (!deviceAlarm || deviceAlarm.enabled !== true) continue;
+          if (!isNowInRange(deviceAlarm.start, deviceAlarm.end)) continue;
+
+          const isUnsafe =
+            device.contact === false ||
+            device.tamper === true;
+
+          if (!isUnsafe) continue;
+
+          const repeatMinutes = parseInt(deviceAlarm.repeatMinutes || 0);
+          const alarmKey = `${receiverUid}_${ownerUid}_${homeId}_${deviceId}_${deviceAlarm.start}_${deviceAlarm.end}_${today}`;
           const lastTime = lastScheduleAlarmMap[alarmKey] || 0;
 
           if (repeatMinutes === 0 && lastTime > 0) continue;
@@ -728,7 +766,10 @@ async function checkScheduledAlarms() {
 
           lastScheduleAlarmMap[alarmKey] = now;
 
-          const detail = safety.unsafeDevices.slice(0, 3).join(", ");
+          const deviceName = device.name || deviceId;
+          const reason = device.contact === false
+            ? `${deviceName}: Cửa đang mở`
+            : `${deviceName}: Thiết bị bị tháo`;
 
           if (!alarmSummaryByUser[receiverUid]) {
             alarmSummaryByUser[receiverUid] = [];
@@ -737,12 +778,10 @@ async function checkScheduledAlarms() {
           alarmSummaryByUser[receiverUid].push({
             homeId,
             homeName: home.name || homeId,
-            reason: detail,
+            reason,
             repeatMinutes,
             nextAlarm: getNextAlarmTimeText(repeatMinutes),
           });
-
-          break;
         }
       }
     }
@@ -908,7 +947,15 @@ client.on("message", async (topic, msg) => {
           name: defaultName,
           ieee,
           type: deviceType,
-
+          alarm:
+            deviceType === "door"
+              ? {
+                enabled: true,
+                start: "23:00",
+                end: "06:00",
+                repeatMinutes: 30,
+              }
+              : null,
           availability: "unknown",
           last_seen: null,
 
@@ -960,8 +1007,27 @@ client.on("message", async (topic, msg) => {
 
       if (!availabilityValue) return;
 
-      const map = deviceMap[deviceId];
-      if (!map) return;
+      let map = deviceMap[deviceId];
+
+      if (!map) {
+        const snap = await db
+          .ref(`system/devices_by_ieee/${deviceId}`)
+          .once("value");
+
+        const found = snap.val();
+
+        if (!found?.uid || !found?.homeId) {
+          console.log("⚠️ AVAILABILITY NO MAP:", deviceId);
+          return;
+        }
+
+        map = {
+          uid: found.uid,
+          homeId: found.homeId,
+        };
+
+        deviceMap[deviceId] = map;
+      }
 
       const { uid, homeId } = map;
 
@@ -1110,11 +1176,11 @@ client.on("message", async (topic, msg) => {
     console.log("📡 UPDATE:", deviceId, updateData);
 
     // ===== NEW MULTI ALARM FORMAT =====
-    // ===== NEW MULTI ALARM FORMAT =====
     await processScheduleAlarmsForOwner(
       uid,
       homeId,
       homeName,
+      deviceId,
       deviceName,
       updateData.type || oldData.type || "door",
       homeData,
@@ -1141,6 +1207,7 @@ client.on("message", async (topic, msg) => {
         sharedUid,
         homeId,
         homeName,
+        deviceId,
         deviceName,
         updateData.type || oldData.type || "door",
         homeData,
