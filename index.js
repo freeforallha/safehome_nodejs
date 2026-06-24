@@ -10,7 +10,9 @@ const lastNotificationMap = {};
 const lastScheduleAlarmMap = {};
 const pendingEventAlarmMap = {};
 const pendingEventAlarmTimerMap = {};
-
+const pendingScheduleReminderMap = {};
+const pendingScheduleReminderTimerMap = {};
+const userDirectoryCache = {};
 function getPiSerial() {
   try {
     const cpuInfo = fs.readFileSync("/proc/cpuinfo", "utf8");
@@ -242,7 +244,74 @@ function startDeviceMapListener() {
     // console.log("🔄 DEVICE MAP:", Object.keys(deviceMap).length); 
   });
 }
+function startUserDirectoryListener() {
+  db.ref("accounts").on("value", async (snap) => {
+    try {
+      const accounts = snap.val() || {};
+      const updates = {};
+      const activeUids = new Set(Object.keys(accounts));
 
+      for (const [uid, rawUser] of Object.entries(accounts)) {
+        const user = rawUser || {};
+        const profile = user.profile || {};
+
+        const directoryData = {
+          email: String(user.email || "")
+            .trim()
+            .toLowerCase(),
+
+          name: String(
+            profile.name ||
+            user.name ||
+            "",
+          ).trim(),
+
+          photoUrl: String(
+            profile.photoUrl ||
+            user.photoUrl ||
+            "",
+          ).trim(),
+        };
+
+        const signature = JSON.stringify(directoryData);
+
+        if (userDirectoryCache[uid] === signature) {
+          continue;
+        }
+
+        userDirectoryCache[uid] = signature;
+
+        updates[`userDirectory/${uid}`] = {
+          ...directoryData,
+          updatedAt: Date.now(),
+        };
+      }
+
+      for (const cachedUid of Object.keys(userDirectoryCache)) {
+        if (activeUids.has(cachedUid)) {
+          continue;
+        }
+
+        delete userDirectoryCache[cachedUid];
+        updates[`userDirectory/${cachedUid}`] = null;
+      }
+
+      if (Object.keys(updates).length > 0) {
+        await db.ref().update(updates);
+
+        console.log(
+          "👤 USER DIRECTORY SYNC:",
+          Object.keys(updates).length,
+        );
+      }
+    } catch (err) {
+      console.log(
+        "USER DIRECTORY SYNC ERROR:",
+        err.message,
+      );
+    }
+  });
+}
 // ================= PERMIT JOIN =================
 function setPermitJoin(enable, time = 60) {
   return new Promise((resolve) => {
@@ -258,12 +327,177 @@ function setPermitJoin(enable, time = 60) {
 }
 
 // ================= PUSH =================
-async function sendScheduledNotification(uid, homeId, text, isSafe, reason = "", reminderItems = []) {
+async function sendScheduledReminderSummary(uid, items) {
+  try {
+    if (!items || items.length === 0) return;
+
+    const uniqueItems = [];
+
+    for (const item of items) {
+      const exists = uniqueItems.some((oldItem) => {
+        return (
+          oldItem.homeId === item.homeId &&
+          oldItem.isSafe === item.isSafe &&
+          oldItem.reason === item.reason
+        );
+      });
+
+      if (!exists) {
+        uniqueItems.push(item);
+      }
+    }
+
+    if (uniqueItems.length === 0) return;
+
+    const allSafe = uniqueItems.every(
+      (item) => item.isSafe === true,
+    );
+
+    const unsafeItems = uniqueItems.filter(
+      (item) => item.isSafe !== true,
+    );
+
+    const reminderItems = [];
+
+    for (const item of uniqueItems) {
+      const rawItems = Array.isArray(item.reminderItems)
+        ? item.reminderItems
+        : [];
+
+      for (const reminderItem of rawItems) {
+        if (!reminderItem) continue;
+
+        const exists = reminderItems.some((oldItem) => {
+          return oldItem.homeId === reminderItem.homeId;
+        });
+
+        if (!exists) {
+          reminderItems.push(reminderItem);
+        }
+      }
+    }
+
+    const title =
+      uniqueItems.length === 1
+        ? uniqueItems[0].homeName || "Nhà"
+        : "SafeHome Reminder";
+
+    let body = "";
+
+    if (uniqueItems.length === 1) {
+      body = uniqueItems[0].text || "";
+    } else if (allSafe) {
+      body =
+        `${uniqueItems.length} nhà đã an toàn. ` +
+        `Hãy an tâm nghỉ ngơi.`;
+    } else {
+      body =
+        `${unsafeItems.length}/${uniqueItems.length} nhà ` +
+        `đang có vấn đề cần kiểm tra.`;
+    }
+
+    const reason = unsafeItems
+      .map((item) => {
+        const homeName = item.homeName || "Nhà";
+        const detail =
+          item.reason || "Có vấn đề cần kiểm tra";
+
+        return `${homeName}: ${detail}`;
+      })
+      .join("\n");
+
+    const tokenSnap = await db
+      .ref(`accounts/${uid}/fcmToken`)
+      .once("value");
+
+    const token = tokenSnap.val();
+
+    if (!token) {
+      console.log(
+        "❌ NO TOKEN FOR SCHEDULE:",
+        uid,
+      );
+      return;
+    }
+
+    await admin.messaging().send({
+      token,
+
+      data: {
+        type: "schedule_notification",
+        title,
+        body,
+        homeId:
+          uniqueItems.length === 1
+            ? uniqueItems[0].homeId || ""
+            : "",
+        uid: uid || "",
+        isSafe: allSafe ? "true" : "false",
+        reason,
+        reminderItems: JSON.stringify(reminderItems),
+        clickAction: "schedule_SCREEN",
+      },
+
+      android: {
+        priority: "high",
+      },
+    });
+
+    console.log(
+      "🔔 SCHEDULE SUMMARY SENT:",
+      uid,
+      uniqueItems.length,
+    );
+  } catch (err) {
+    console.log(
+      "SCHEDULE SUMMARY ERROR:",
+      err.message,
+    );
+  }
+}
+
+function queueScheduledReminder(uid, item) {
+  if (!pendingScheduleReminderMap[uid]) {
+    pendingScheduleReminderMap[uid] = [];
+  }
+
+  pendingScheduleReminderMap[uid].push(item);
+
+  if (pendingScheduleReminderTimerMap[uid]) {
+    return;
+  }
+
+  pendingScheduleReminderTimerMap[uid] = setTimeout(
+    async () => {
+      const items =
+        pendingScheduleReminderMap[uid] || [];
+
+      delete pendingScheduleReminderMap[uid];
+      delete pendingScheduleReminderTimerMap[uid];
+
+      await sendScheduledReminderSummary(
+        uid,
+        items,
+      );
+    },
+    8000,
+  );
+}
+
+async function sendScheduledNotification(
+  uid,
+  homeId,
+  homeName,
+  text,
+  isSafe,
+  reason = "",
+  reminderItems = [],
+) {
   try {
     const now = Date.now();
-    const key = `${uid}_${homeId}_${text}_${getCurrentHHMM()}`;
+    const key =
+      `${uid}_${homeId}_${text}_${getCurrentHHMM()}`;
 
-    // chống spam trong 70 giây
     if (
       lastNotificationMap[key] &&
       now - lastNotificationMap[key] < 70 * 1000
@@ -273,47 +507,144 @@ async function sendScheduledNotification(uid, homeId, text, isSafe, reason = "",
 
     lastNotificationMap[key] = now;
 
-    const snap = await db.ref(`accounts/${uid}/fcmToken`).once("value");
-    const token = snap.val();
-
-    if (!token) {
-      console.log("❌ NO TOKEN FOR SCHEDULE:", uid);
-      return;
-    }
-    await admin.messaging().send({
-      token,
-
-      data: {
-        type: "schedule_notification",
-        title: "🏡 SAFEHOME",
-        body: text || "",
-        homeId: homeId || "",
-        uid: uid || "",
-        isSafe: isSafe ? "true" : "false",
-        reason: reason || "",
-        reminderItems: JSON.stringify(reminderItems || []),
-        clickAction: "schedule_SCREEN",
-      },
-
-      android: {
-        priority: "high",
-      },
+    await addHomeNotificationFromBackend({
+      uid,
+      homeId,
+      homeName,
+      type: "reminder_triggered",
+      category: "reminder",
+      severity: isSafe ? "success" : "warning",
+      title: isSafe
+        ? "Reminder: Nhà đã an toàn"
+        : "Reminder: Cần kiểm tra",
+      message: isSafe
+        ? "Nhà đang an toàn. Hãy an tâm nghỉ ngơi."
+        : `Cần kiểm tra: ${reason ||
+        "Nhà đang có vấn đề cần chú ý."
+        }`,
+      entityType: "home",
+      entityId: homeId,
     });
 
-    console.log("🔔 SCHEDULE NOTIFICATION:", uid, homeId, text);
+    queueScheduledReminder(uid, {
+      homeId,
+      homeName,
+      text,
+      isSafe,
+      reason,
+      reminderItems,
+    });
   } catch (err) {
-    console.log("NOTIFICATION SEND ERROR:", err.message);
+    console.log(
+      "NOTIFICATION SEND ERROR:",
+      err.message,
+    );
   }
 }
-async function canReceiveAlarm(uid, homeId) {
+function getTodayKey() {
+  const now = new Date();
+  const yyyy = now.getFullYear();
+  const mm = String(now.getMonth() + 1).padStart(2, "0");
+  const dd = String(now.getDate()).padStart(2, "0");
+
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function isTimeInPauseRange(startTime, endTime) {
+  if (!startTime || !endTime) return false;
+  return isNowInRange(startTime, endTime);
+}
+
+async function isHomeAlarmPausedToday(ownerUid, homeId) {
   try {
     const snap = await db
+      .ref(`accounts/${ownerUid}/homes/${homeId}/alarmPauseToday`)
+      .once("value");
+
+    const pause = snap.val();
+
+    if (!pause) return false;
+
+    const today = getTodayKey();
+
+    if (pause.date !== today) {
+      try {
+        await db
+          .ref(`accounts/${ownerUid}/homes/${homeId}/alarmPauseToday`)
+          .remove();
+      } catch (_) { }
+
+      return false;
+    }
+
+    const paused = isTimeInPauseRange(
+      pause.start,
+      pause.end,
+    );
+
+    if (paused) {
+      return true;
+    }
+
+    const now = getCurrentHHMM();
+
+    const start = toMin(pause.start);
+    const end = toMin(pause.end);
+    const current = toMin(now);
+
+    let pauseFinished = false;
+
+    if (start > end) {
+      pauseFinished =
+        current > end &&
+        current < start;
+    } else {
+      pauseFinished =
+        current > end;
+    }
+
+    if (pauseFinished) {
+      try {
+        await db
+          .ref(`accounts/${ownerUid}/homes/${homeId}/alarmPauseToday`)
+          .remove();
+
+        console.log(
+          "🧹 ALARM PAUSE REMOVED:",
+          ownerUid,
+          homeId,
+        );
+      } catch (_) { }
+    }
+
+    return false;
+  } catch (err) {
+    console.log("ALARM PAUSE CHECK ERROR:", err.message);
+    return false;
+  }
+}
+
+async function canReceiveAlarm(uid, homeId, ownerUid = uid) {
+  try {
+    const settingSnap = await db
       .ref(`accounts/${uid}/alarmSettings/${homeId}/enabled`)
       .once("value");
 
-    const enabled = snap.val();
+    const enabled = settingSnap.val();
 
-    return enabled !== false;
+    // Mặc định là bật, chỉ tắt khi user chủ động set false
+    if (enabled === false) {
+      return false;
+    }
+
+    const paused = await isHomeAlarmPausedToday(ownerUid, homeId);
+
+    if (paused) {
+      console.log("⏸️ HOME ALARM PAUSED TODAY:", ownerUid, homeId);
+      return false;
+    }
+
+    return true;
   } catch (err) {
     console.log("ALARM SETTING CHECK ERROR:", err.message);
     return true;
@@ -382,11 +713,148 @@ async function sendAlarm(uid, homeId, reason) {
     console.log("FCM ERROR:", err.message);
   }
 }
-async function sendAlarmSummary(uid, items) {
+async function sendAlarmPauseNotification(
+  uid,
+  homeId,
+  homeName,
+  text,
+) {
   try {
-    if (!items || items.length === 0) {
+    const snap = await db
+      .ref(`accounts/${uid}/fcmToken`)
+      .once("value");
+
+    const token = snap.val();
+
+    if (!token) {
       return;
     }
+
+    await admin.messaging().send({
+      token,
+
+      data: {
+        type: "schedule_notification",
+        forceShow: "true",
+        reason: text,
+        severity: "warning",
+        isSafe: "false",
+        title: homeName || "Nhà",
+        body: text,
+        homeId: homeId || "",
+        uid: uid || "",
+        clickAction: "schedule_SCREEN",
+      },
+
+      android: {
+        priority: "high",
+        notification: {
+          title: homeName || "Nhà",
+          body: text,
+          channelId: "safehome_schedule_fullscreen_channel",
+        },
+      },
+    });
+
+    console.log(
+      "⏸️ ALARM PAUSE WARNING SENT:",
+      uid,
+      homeId,
+    );
+  } catch (err) {
+    console.log(
+      "ALARM PAUSE NOTIFICATION ERROR:",
+      err.message,
+    );
+  }
+}
+async function addHomeNotificationFromBackend({
+  uid,
+  homeId,
+  homeName,
+  type,
+  title,
+  message,
+  category = "home",
+  severity = "info",
+  entityType = "home",
+  entityId = "",
+}) {
+  try {
+    if (!uid || !homeId) {
+      return;
+    }
+
+    const now = Date.now();
+    const resolvedHomeName =
+      String(homeName || "").trim() || homeId;
+
+    const listRef = db.ref(
+      `accounts/${uid}/notifications`,
+    );
+
+    const notificationRef = listRef.push();
+
+    await notificationRef.set({
+      id: notificationRef.key,
+      type,
+      category,
+      severity,
+      title,
+      message,
+      homeId,
+      homeName: resolvedHomeName,
+      entityType,
+      entityId: entityId || homeId,
+      data: {
+        homeName: resolvedHomeName,
+      },
+      time: now,
+      read: false,
+    });
+
+    const snap = await listRef
+      .orderByChild("time")
+      .once("value");
+
+    const notifications = snap.val() || {};
+    const entries = Object.entries(notifications);
+
+    if (entries.length > 120) {
+      entries.sort((a, b) => {
+        return (
+          Number(a[1]?.time || 0) -
+          Number(b[1]?.time || 0)
+        );
+      });
+
+      const updates = {};
+      const removeCount = entries.length - 120;
+
+      for (const [key] of entries.slice(0, removeCount)) {
+        updates[key] = null;
+      }
+
+      await listRef.update(updates);
+    }
+
+    console.log(
+      "🏠 HOME NOTIFICATION:",
+      uid,
+      type,
+      homeId,
+    );
+  } catch (err) {
+    console.log(
+      "HOME NOTIFICATION ERROR:",
+      err.message,
+    );
+  }
+}
+async function sendAlarmSummary(uid, items) {
+  try {
+    if (!items || items.length === 0) return;
+
     const uniqueItems = [];
 
     for (const item of items) {
@@ -394,18 +862,25 @@ async function sendAlarmSummary(uid, items) {
         return oldItem.homeId === item.homeId && oldItem.reason === item.reason;
       });
 
-      if (!exists) {
-        uniqueItems.push(item);
+      if (!exists) uniqueItems.push(item);
+    }
+
+    const allowedItems = [];
+
+    for (const item of uniqueItems) {
+      const enabled = await canReceiveAlarm(
+        uid,
+        item.homeId,
+        item.ownerUid || uid,
+      );
+
+      if (enabled) {
+        allowedItems.push(item);
       }
     }
 
-    items = uniqueItems;
-    const firstHomeId = items[0].homeId;
-
-    const enabled = await canReceiveAlarm(uid, firstHomeId);
-
-    if (!enabled) {
-      console.log("🔕 ALARM SUMMARY MUTED BY USER:", uid, firstHomeId);
+    if (allowedItems.length === 0) {
+      console.log("🔕 ALARM SUMMARY MUTED ALL:", uid);
       return;
     }
 
@@ -417,14 +892,15 @@ async function sendAlarmSummary(uid, items) {
       return;
     }
 
-    const lines = items.slice(0, 4).map((item) => {
+    const lines = allowedItems.slice(0, 4).map((item) => {
       return `${item.homeName}: ${item.reason}`;
     });
 
-    if (items.length > 4) {
+    if (allowedItems.length > 4) {
       lines.push("...");
     }
-    console.log("🚨 ALARM ITEMS:", JSON.stringify(items, null, 2));
+
+    console.log("🚨 ALARM ITEMS:", JSON.stringify(allowedItems, null, 2));
 
     await admin.messaging().send({
       token,
@@ -433,7 +909,7 @@ async function sendAlarmSummary(uid, items) {
         type: "alarm",
         title: "🚨 SAFEHOME",
         body: lines.join("\n"),
-        alarmItems: JSON.stringify(items),
+        alarmItems: JSON.stringify(allowedItems),
         clickAction: "alarm_SCREEN",
       },
 
@@ -458,7 +934,7 @@ async function sendAlarmSummary(uid, items) {
       },
     });
 
-    console.log("🚨 SUMMARY PUSH SENT:", uid, items.length);
+    console.log("🚨 SUMMARY PUSH SENT:", uid, allowedItems.length);
   } catch (err) {
     console.log("SUMMARY ALARM ERROR:", err.message);
   }
@@ -490,14 +966,111 @@ function queueEventAlarm(uid, item) {
   }, 1200);
 }
 // ================= SCHEDULE CHECK =================
+async function cleanupExpiredAlarmPause() {
+  try {
+    const snap = await db.ref("accounts").once("value");
+
+    const accounts = snap.val() || {};
+
+    const today = getTodayKey();
+    const now = getCurrentHHMM();
+
+    for (const [uid, user] of Object.entries(accounts)) {
+      const homes = user.homes || {};
+
+      for (const [homeId, home] of Object.entries(homes)) {
+        const pause = home.alarmPauseToday;
+
+        if (!pause) continue;
+
+        if (pause.date !== today) {
+          await db
+            .ref(`accounts/${uid}/homes/${homeId}/alarmPauseToday`)
+            .remove();
+
+          const sharedSnap = await db
+            .ref(`sharedByHome/${homeId}`)
+            .once("value");
+
+          const sharedUsers = sharedSnap.val() || {};
+
+          for (const sharedUid of Object.keys(sharedUsers)) {
+            await db
+              .ref(
+                `accounts/${sharedUid}/sharedHomes/${homeId}/alarmPauseToday`,
+              )
+              .remove();
+          }
+
+          console.log("🧹 OLD ALARM PAUSE REMOVED:", uid, homeId);
+
+          continue;
+        }
+
+        if (
+          !isTimeInPauseRange(
+            pause.start,
+            pause.end,
+          )
+        ) {
+          const start = toMin(pause.start);
+          const end = toMin(pause.end);
+          const current = toMin(now);
+
+          let finished = false;
+
+          if (start > end) {
+            finished =
+              current > end &&
+              current < start;
+          } else {
+            finished =
+              current > end;
+          }
+
+          if (finished) {
+            await db
+              .ref(`accounts/${uid}/homes/${homeId}/alarmPauseToday`)
+              .remove();
+
+            const sharedSnap = await db
+              .ref(`sharedByHome/${homeId}`)
+              .once("value");
+
+            const sharedUsers = sharedSnap.val() || {};
+
+            for (const sharedUid of Object.keys(sharedUsers)) {
+              await db
+                .ref(
+                  `accounts/${sharedUid}/sharedHomes/${homeId}/alarmPauseToday`,
+                )
+                .remove();
+            }
+
+            console.log(
+              "🧹 EXPIRED ALARM PAUSE REMOVED:",
+              uid,
+              homeId,
+            );
+          }
+        }
+      }
+    }
+  } catch (err) {
+    console.log(
+      "ALARM PAUSE CLEANUP ERROR:",
+      err.message,
+    );
+  }
+}
 async function checkScheduledNotifications() {
   try {
     const snap = await db.ref("accounts").once("value");
     const accounts = snap.val() || {};
-    const current = getCurrentHHMM(); priority: "high",
+    const current = getCurrentHHMM();
 
 
-      console.log("⏰ CHECK SCHEDULE:", current);
+    console.log("⏰ CHECK SCHEDULE:", current);
 
     for (const [uid, user] of Object.entries(accounts)) {
       const ownHomes = user.homes || {};
@@ -559,8 +1132,18 @@ async function checkScheduledNotifications() {
         }
 
         for (const item of notifications) {
+          console.log(
+            "🔎 REMINDER DEBUG:",
+            receiverUid,
+            homeId,
+            source,
+            JSON.stringify(item),
+            "CURRENT:",
+            current,
+          );
+
           if (!item || item.enabled !== true) continue;
-          if (item.time !== current) continue;
+          if (String(item.time || "").trim() !== current) continue;
 
           const homeName = home.name || homeId;
           const safety = getHomeNotificationSafety(home);
@@ -569,7 +1152,11 @@ async function checkScheduledNotifications() {
             await sendScheduledNotification(
               receiverUid,
               homeId,
-              "Nhà bạn đã an toàn, hãy an tâm đi ngủ.",
+              homeName,
+              `Nhà bạn đã an toàn, hãy an tâm đi ngủ.
+
+Nếu hôm nay bạn có kế hoạch ra/vào nhà trong thời gian Alarm hoạt động,
+hãy thiết lập "Tạm tắt Alarm hôm nay" để tránh làm phiền các thành viên khác.`,
               true,
               "",
               [
@@ -586,7 +1173,11 @@ async function checkScheduledNotifications() {
             await sendScheduledNotification(
               receiverUid,
               homeId,
-              `⚠️ Nhà ${homeName} chưa an toàn: ${detail}`,
+              homeName,
+              `⚠️ Nhà ${homeName} chưa an toàn: ${detail}
+
+Nếu hôm nay bạn có kế hoạch ra/vào nhà trong thời gian Alarm hoạt động,
+hãy thiết lập "Tạm tắt Alarm hôm nay" để tránh làm phiền các thành viên khác.`,
               false,
               detail,
               [
@@ -888,7 +1479,11 @@ async function checkScheduledAlarms() {
       for (const item of homesToCheck) {
         const { receiverUid, ownerUid, homeId, home, source } = item;
 
-        const canReceive = await canReceiveAlarm(receiverUid, homeId);
+        const canReceive = await canReceiveAlarm(
+          receiverUid,
+          homeId,
+          ownerUid,
+        );
         if (!canReceive) {
           console.log("🔕 ALARM MUTED BY USER:", receiverUid, homeId);
           continue;
@@ -969,6 +1564,7 @@ async function checkScheduledAlarms() {
           }
 
           alarmSummaryByUser[receiverUid].push({
+            ownerUid,
             homeId,
             homeName: home.name || homeId,
             deviceName,
@@ -991,10 +1587,11 @@ async function checkScheduledAlarms() {
 // ================= INIT =================
 async function init() {
   startDeviceMapListener();
-
+  startUserDirectoryListener();
   await db.ref("pair_requests").remove();
   console.log("🧹 OLD PAIR REQUESTS CLEARED");
 
+  setInterval(cleanupExpiredAlarmPause, 60000);
   setInterval(checkScheduledNotifications, 60000);
   setInterval(checkScheduledAlarms, 60000);
 }
@@ -1036,13 +1633,209 @@ db.ref("device_delete_requests").on("child_added", async (snap) => {
     console.log("DELETE DEVICE ERROR:", err.message);
   }
 });
+db.ref("alarm_pause_requests").on("child_added", async (snap) => {
+  try {
+    const req = snap.val();
+
+    if (!req) return;
+    if (req.status !== "pending") return;
+
+    const {
+      ownerUid,
+      homeId,
+      date,
+      start,
+      end,
+      reason,
+      createdByUid,
+      createdByName,
+      action,
+    } = req;
+
+    if (!ownerUid || !homeId) {
+      await snap.ref.remove();
+      return;
+    }
+
+    if (action === "remove") {
+      await db
+        .ref(`accounts/${ownerUid}/homes/${homeId}/alarmPauseToday`)
+        .remove();
+
+      const sharedSnap = await db
+        .ref(`sharedByHome/${homeId}`)
+        .once("value");
+
+      const sharedUsers = sharedSnap.val() || {};
+
+      for (const sharedUid of Object.keys(sharedUsers)) {
+        await db
+          .ref(
+            `accounts/${sharedUid}/sharedHomes/${homeId}/alarmPauseToday`,
+          )
+          .remove();
+      }
+
+      await snap.ref.remove();
+
+      console.log(
+        "🧹 ALARM PAUSE REMOVED:",
+        ownerUid,
+        homeId,
+      );
+
+      return;
+    }
+
+    if (!date || !start || !end) {
+      await snap.ref.remove();
+      return;
+    }
+
+    const pauseData = {
+      date,
+      start,
+      end,
+      reason: reason || "",
+      createdByUid: createdByUid || "",
+      createdByName: createdByName || "",
+      createdAt: Date.now(),
+    };
+
+    await db
+      .ref(`accounts/${ownerUid}/homes/${homeId}/alarmPauseToday`)
+      .set(pauseData);
+    console.log(
+      "PAUSE DEBUG:",
+      ownerUid,
+      createdByUid,
+      createdByName,
+    );
+    const sharedSnap = await db
+      .ref(`sharedByHome/${homeId}`)
+      .once("value");
+
+    const sharedUsers = sharedSnap.val() || {};
+
+    for (const sharedUid of Object.keys(sharedUsers)) {
+      await db
+        .ref(
+          `accounts/${sharedUid}/sharedHomes/${homeId}/alarmPauseToday`,
+        )
+        .set(pauseData);
+    }
+
+    await snap.ref.remove();
+
+    console.log("⏸️ ALARM PAUSE REQUEST APPLIED:", ownerUid, homeId);
+  } catch (err) {
+    console.log("ALARM PAUSE REQUEST ERROR:", err.message);
+  }
+});
+db.ref("accounts").on("child_changed", async (snap) => {
+  try {
+    const ownerUid = snap.key;
+    const user = snap.val() || {};
+    const homes = user.homes || {};
+
+    for (const [homeId, home] of Object.entries(homes)) {
+      const pause = home.alarmPauseToday;
+
+      if (!pause) continue;
+
+      const key =
+        `${ownerUid}_${homeId}_${pause.createdAt || 0}`;
+
+      if (lastNotificationMap[key]) {
+        continue;
+      }
+
+      lastNotificationMap[key] = Date.now();
+
+      const homeName =
+        (pause.homeName && pause.homeName.trim()) ||
+        (home.name && home.name.trim()) ||
+        homeId;
+
+      const actorName =
+        pause.createdByName &&
+          pause.createdByName.trim().length > 0
+          ? pause.createdByName.trim()
+          : "Một thành viên";
+
+      const text =
+        `Alarm đã được ${actorName} tạm tắt từ ${pause.start} tới ${pause.end}.
+
+Nên trong khoảng thời gian này:
+• Một số thiết bị an ninh sẽ tạm ngừng cảnh báo.
+• Các cảnh báo nguy hiểm như cháy nổ, ngập nước, chạm chập v.v... vẫn được gửi bình thường.`;
+
+      const sharedSnap = await db
+        .ref(`sharedByHome/${homeId}`)
+        .once("value");
+
+      const sharedUsers = sharedSnap.val() || {};
+
+      const recipientUids = new Set([
+        ownerUid,
+        ...Object.keys(sharedUsers),
+      ]);
+
+      const pauseReason =
+        String(pause.reason || "").trim();
+
+      const homeNotificationMessage =
+        `${actorName} đã tạm dừng Alarm từ ${pause.start} đến ${pause.end}.` +
+        (
+          pauseReason.length > 0
+            ? ` Lý do: ${pauseReason}.`
+            : ""
+        );
+
+      for (const recipientUid of recipientUids) {
+        await addHomeNotificationFromBackend({
+          uid: recipientUid,
+          homeId,
+          homeName,
+          type: "alarm_pause_started",
+          category: "alarm",
+          severity: "warning",
+          title: "Alarm đã được tạm dừng",
+          message: homeNotificationMessage,
+          entityType: "home",
+          entityId: homeId,
+        });
+
+        if (recipientUid === pause.createdByUid) {
+          continue;
+        }
+
+        await sendAlarmPauseNotification(
+          recipientUid,
+          homeId,
+          homeName,
+          text,
+        );
+      }
+
+      console.log(
+        "⏸️ ALARM PAUSE BROADCAST:",
+        homeId,
+      );
+    }
+  } catch (err) {
+    console.log(
+      "ALARM PAUSE WATCH ERROR:",
+      err.message,
+    );
+  }
+});
 init();
 
 // ================= MQTT CONNECT =================
 client.on("connect", () => {
   console.log("MQTT CONNECTED");
   client.subscribe("zigbee2mqtt/#");
-  client.subscribe("zigbee2mqtt/bridge/event");
 });
 
 // ================= PAIRING =================
