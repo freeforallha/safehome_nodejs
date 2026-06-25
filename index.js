@@ -1595,141 +1595,1386 @@ async function init() {
   setInterval(checkScheduledNotifications, 60000);
   setInterval(checkScheduledAlarms, 60000);
 }
-db.ref("device_delete_requests").on("child_added", async (snap) => {
-  try {
-    const req = snap.val();
+const deviceDeleteInProgress = new Set();
 
-    if (!req) return;
-    if (req.status !== "pending") return;
+const homeNotificationRequestInProgress = new Set();
+const lastHomeNotificationRequestMap = {};
 
-    const { ownerUid, homeId, deviceId } = req;
+db.ref("home_notification_requests").on("child_added", async (snap) => {
+  const req = snap.val();
+  const requestId = snap.key;
 
-    console.log("🗑️ DELETE DEVICE:", deviceId);
-
-    client.publish(
-      "zigbee2mqtt/bridge/request/device/remove",
-      JSON.stringify({
-        id: deviceId,
-        force: true,
-      }),
+  async function rejectRequest(reason) {
+    console.log(
+      "❌ HOME NOTIFICATION REQUEST REJECTED:",
+      requestId,
+      reason,
     );
 
-    await new Promise((r) => setTimeout(r, 3000));
-
-    await db
-      .ref(`accounts/${ownerUid}/homes/${homeId}/devices/${deviceId}`)
-      .remove();
-
-    await db.ref(`system/devices_by_ieee/${deviceId}`).remove();
-
-    await snap.ref.remove();
-
-    console.log("🧹 DELETE REQUEST REMOVED:", snap.key);
-
-    delete deviceMap[deviceId];
-
-    console.log("✅ DEVICE REMOVED:", deviceId);
-  } catch (err) {
-    console.log("DELETE DEVICE ERROR:", err.message);
-  }
-});
-db.ref("alarm_pause_requests").on("child_added", async (snap) => {
-  try {
-    const req = snap.val();
-
-    if (!req) return;
-    if (req.status !== "pending") return;
-
-    const {
-      ownerUid,
-      homeId,
-      date,
-      start,
-      end,
-      reason,
-      createdByUid,
-      createdByName,
-      action,
-    } = req;
-
-    if (!ownerUid || !homeId) {
+    try {
       await snap.ref.remove();
+    } catch (_) {}
+  }
+
+  try {
+    if (!req || !requestId) {
       return;
     }
 
-    if (action === "remove") {
-      await db
-        .ref(`accounts/${ownerUid}/homes/${homeId}/alarmPauseToday`)
-        .remove();
+    if (homeNotificationRequestInProgress.has(requestId)) {
+      return;
+    }
+
+    homeNotificationRequestInProgress.add(requestId);
+
+    const requestedBy = String(
+      req.requestedBy || "",
+    ).trim();
+
+    const ownerUid = String(
+      req.ownerUid || "",
+    ).trim();
+
+    const homeId = String(
+      req.homeId || "",
+    ).trim();
+
+    const recipientUid = String(
+      req.recipientUid || "",
+    ).trim();
+
+    const type = String(
+      req.type || "",
+    ).trim();
+
+    const category = String(
+      req.category || "",
+    ).trim();
+
+    const severity = String(
+      req.severity || "",
+    ).trim();
+
+    const title = String(
+      req.title || "",
+    ).trim();
+
+    const message = String(
+      req.message || "",
+    ).trim();
+
+    const deviceId = String(
+      req.deviceId || "",
+    ).trim();
+
+    const entityType = String(
+      req.entityType || "",
+    ).trim();
+
+    const entityId = String(
+      req.entityId || "",
+    ).trim();
+
+    const requestTime = Number(req.time);
+    const now = Date.now();
+
+    const allowedCategories = new Set([
+      "home",
+      "device",
+      "member",
+      "alarm",
+      "reminder",
+    ]);
+
+    const allowedSeverities = new Set([
+      "info",
+      "success",
+      "warning",
+    ]);
+
+    const requestTargetedTypes = new Set([
+      "share_request",
+      "join_request",
+      "transfer_owner_request",
+    ]);
+
+    const memberTargetedTypes = new Set([
+      "share_request_accepted",
+      "join_request_accepted",
+      "member_join",
+      "transfer_owner_accepted",
+      "role_changed",
+      "member_removed",
+    ]);
+
+    const targetedTypes = new Set([
+      ...requestTargetedTypes,
+      ...memberTargetedTypes,
+    ]);
+
+    const invalidRequest =
+      req.status !== "pending" ||
+      requestedBy.length === 0 ||
+      requestedBy.length > 128 ||
+      ownerUid.length === 0 ||
+      ownerUid.length > 128 ||
+      homeId.length === 0 ||
+      homeId.length > 120 ||
+      recipientUid.length > 128 ||
+      type.length === 0 ||
+      type.length > 80 ||
+      !allowedCategories.has(category) ||
+      !allowedSeverities.has(severity) ||
+      title.length === 0 ||
+      title.length > 160 ||
+      message.length === 0 ||
+      message.length > 1000 ||
+      typeof req.includeActor !== "boolean" ||
+      typeof req.writeHomeTimeline !== "boolean" ||
+      !Number.isFinite(requestTime) ||
+      requestTime > now + 1000 ||
+      requestTime < now - 5 * 60 * 1000;
+
+    if (invalidRequest) {
+      await rejectRequest("INVALID DATA");
+      return;
+    }
+
+    const isTargeted = recipientUid.length > 0;
+
+    if (isTargeted && !targetedTypes.has(type)) {
+      await rejectRequest("TARGET TYPE NOT ALLOWED");
+      return;
+    }
+
+    if (
+      isTargeted &&
+      req.writeHomeTimeline !== false
+    ) {
+      await rejectRequest("TARGET TIMELINE NOT ALLOWED");
+      return;
+    }
+
+    if (!isTargeted && targetedTypes.has(type)) {
+      await rejectRequest("RECIPIENT REQUIRED");
+      return;
+    }
+
+    const rateKey =
+      `${requestedBy}_${homeId}_${recipientUid}_${type}`;
+
+    const lastRequestTime =
+      lastHomeNotificationRequestMap[rateKey] || 0;
+
+    if (now - lastRequestTime < 750) {
+      await rejectRequest("RATE LIMITED");
+      return;
+    }
+
+    lastHomeNotificationRequestMap[rateKey] = now;
+
+    const homeSnap = await db
+      .ref(`accounts/${ownerUid}/homes/${homeId}`)
+      .once("value");
+
+    if (!homeSnap.exists()) {
+      await rejectRequest("HOME NOT FOUND");
+      return;
+    }
+
+    const home = homeSnap.val() || {};
+    let role = "owner";
+
+    if (
+      isTargeted &&
+      type === "join_request"
+    ) {
+      if (recipientUid !== ownerUid) {
+        await rejectRequest("INVALID JOIN RECIPIENT");
+        return;
+      }
+
+      const joinRequestSnap = await db
+        .ref(
+          `accounts/${ownerUid}/shareRequests/${homeId}_${requestedBy}`,
+        )
+        .once("value");
+
+      const joinRequest =
+        joinRequestSnap.val() || {};
+
+      if (
+        joinRequest.type !== "join_request" ||
+        joinRequest.ownerUid !== ownerUid ||
+        joinRequest.targetUid !== requestedBy ||
+        joinRequest.homeId !== homeId
+      ) {
+        await rejectRequest("JOIN REQUEST NOT FOUND");
+        return;
+      }
+
+      role = "requester";
+    } else if (requestedBy !== ownerUid) {
+      const [sharedHomeSnap, sharedMemberSnap] =
+        await Promise.all([
+          db
+            .ref(
+              `accounts/${requestedBy}/sharedHomes/${homeId}`,
+            )
+            .once("value"),
+
+          db
+            .ref(
+              `sharedByHome/${homeId}/${requestedBy}`,
+            )
+            .once("value"),
+        ]);
+
+      const sharedHome =
+        sharedHomeSnap.val() || {};
+
+      if (
+        sharedHome.ownerUid !== ownerUid ||
+        !sharedMemberSnap.exists()
+      ) {
+        await rejectRequest("MEMBERSHIP NOT FOUND");
+        return;
+      }
+
+      role = String(
+        sharedHome.role || "",
+      ).trim();
+
+      if (
+        role !== "admin" &&
+        role !== "member"
+      ) {
+        await rejectRequest("INVALID ROLE");
+        return;
+      }
+    }
+
+    if (
+      isTargeted &&
+      type === "share_request"
+    ) {
+      if (
+        role !== "owner" &&
+        role !== "admin"
+      ) {
+        await rejectRequest("NO SHARE PERMISSION");
+        return;
+      }
+
+      const shareRequestSnap = await db
+        .ref(
+          `accounts/${recipientUid}/shareRequests/${homeId}`,
+        )
+        .once("value");
+
+      const shareRequest =
+        shareRequestSnap.val() || {};
+
+      if (
+        shareRequest.type !== "share_request" ||
+        shareRequest.ownerUid !== ownerUid ||
+        shareRequest.targetUid !== recipientUid ||
+        shareRequest.homeId !== homeId
+      ) {
+        await rejectRequest("SHARE REQUEST NOT FOUND");
+        return;
+      }
+    }
+
+    if (
+      isTargeted &&
+      type === "transfer_owner_request"
+    ) {
+      if (
+        requestedBy !== ownerUid ||
+        recipientUid === ownerUid
+      ) {
+        await rejectRequest("NO TRANSFER PERMISSION");
+        return;
+      }
+
+      const transferRequestSnap = await db
+        .ref(
+          `accounts/${recipientUid}/shareRequests/transfer_${homeId}_${ownerUid}`,
+        )
+        .once("value");
+
+      const transferRequest =
+        transferRequestSnap.val() || {};
+
+      if (
+        transferRequest.type !==
+          "transfer_owner_request" ||
+        transferRequest.homeId !== homeId ||
+        transferRequest.oldOwnerUid !== ownerUid ||
+        transferRequest.newOwnerUid !== recipientUid
+      ) {
+        await rejectRequest(
+          "TRANSFER REQUEST NOT FOUND",
+        );
+        return;
+      }
+    }
+
+    if (
+      isTargeted &&
+      memberTargetedTypes.has(type)
+    ) {
+      const recipientAccountSnap = await db
+        .ref(`accounts/${recipientUid}`)
+        .once("value");
+
+      if (!recipientAccountSnap.exists()) {
+        await rejectRequest("RECIPIENT NOT FOUND");
+        return;
+      }
+
+      let recipientIsMember =
+        recipientUid === ownerUid;
+
+      if (!recipientIsMember && type !== "member_removed") {
+        const [recipientHomeSnap, recipientMemberSnap] =
+          await Promise.all([
+            db
+              .ref(
+                `accounts/${recipientUid}/sharedHomes/${homeId}`,
+              )
+              .once("value"),
+
+            db
+              .ref(
+                `sharedByHome/${homeId}/${recipientUid}`,
+              )
+              .once("value"),
+          ]);
+
+        const recipientHome =
+          recipientHomeSnap.val() || {};
+
+        recipientIsMember =
+          recipientHome.ownerUid === ownerUid &&
+          recipientMemberSnap.exists();
+      }
+
+      if (
+        !recipientIsMember &&
+        type !== "member_removed"
+      ) {
+        await rejectRequest(
+          "RECIPIENT MEMBERSHIP NOT FOUND",
+        );
+        return;
+      }
+
+      if (
+        (
+          type === "join_request_accepted" ||
+          type === "member_join"
+        ) &&
+        role !== "owner" &&
+        role !== "admin"
+      ) {
+        await rejectRequest("NO ACCEPT PERMISSION");
+        return;
+      }
+
+      if (
+        type === "role_changed" &&
+        requestedBy !== ownerUid
+      ) {
+        await rejectRequest("ONLY OWNER CAN CHANGE ROLE");
+        return;
+      }
+
+      if (
+        type === "member_removed" &&
+        (
+          recipientUid === ownerUid ||
+          (
+            role !== "owner" &&
+            role !== "admin"
+          )
+        )
+      ) {
+        await rejectRequest("NO REMOVE PERMISSION");
+        return;
+      }
+
+      if (
+        type === "transfer_owner_accepted" &&
+        requestedBy !== ownerUid
+      ) {
+        await rejectRequest(
+          "ONLY NEW OWNER CAN CONFIRM TRANSFER",
+        );
+        return;
+      }
+    }
+
+    const isMemberLeave =
+      !isTargeted &&
+      role === "member" &&
+      type === "member_leave";
+
+    if (
+      !isTargeted &&
+      role === "member" &&
+      !isMemberLeave
+    ) {
+      await rejectRequest("MEMBER TYPE NOT ALLOWED");
+      return;
+    }
+
+    if (
+      isMemberLeave &&
+      (
+        category !== "member" ||
+        severity !== "warning" ||
+        entityType !== "member" ||
+        entityId !== requestedBy ||
+        req.includeActor !== false
+      )
+    ) {
+      await rejectRequest("INVALID MEMBER LEAVE");
+      return;
+    }
+
+    if (
+      !isTargeted &&
+      category === "device"
+    ) {
+      const allowsNoDeviceId =
+        type === "pair_started";
+
+      if (allowsNoDeviceId) {
+        if (
+          deviceId.length > 0 ||
+          entityType === "device"
+        ) {
+          await rejectRequest(
+            "INVALID DEVICE TARGET",
+          );
+          return;
+        }
+      } else if (
+        deviceId.length === 0 ||
+        !homeSnap
+          .child("devices")
+          .child(deviceId)
+          .exists()
+      ) {
+        await rejectRequest("DEVICE NOT FOUND");
+        return;
+      }
+    }
+
+    if (
+      entityType.length > 0 &&
+      entityType !== "home" &&
+      entityType !== "device" &&
+      entityType !== "member"
+    ) {
+      await rejectRequest("INVALID ENTITY TYPE");
+      return;
+    }
+
+    if (
+      !isTargeted &&
+      entityType === "device" &&
+      (
+        deviceId.length === 0 ||
+        entityId !== deviceId
+      )
+    ) {
+      await rejectRequest("INVALID DEVICE ENTITY");
+      return;
+    }
+
+    const actorSnap = await db
+      .ref(`accounts/${requestedBy}`)
+      .once("value");
+
+    const actor = actorSnap.val() || {};
+    const actorProfile = actor.profile || {};
+
+    const actorName =
+      String(
+        actorProfile.name ||
+        actor.name ||
+        actor.email ||
+        "Một thành viên",
+      ).trim() || "Một thành viên";
+
+    const homeName =
+      String(home.name || "").trim() || homeId;
+
+    let finalType = type;
+    let finalCategory = category;
+    let finalSeverity = severity;
+    let finalTitle = title;
+    let finalMessage = message;
+    let finalEntityType =
+      entityType || (deviceId ? "device" : "home");
+    let finalEntityId =
+      entityId || deviceId || homeId;
+
+    if (isMemberLeave) {
+      finalCategory = "member";
+      finalSeverity = "warning";
+      finalTitle = "Thành viên rời nhà";
+      finalMessage =
+        `${actorName} đã rời khỏi nhà "${homeName}".`;
+      finalEntityType = "member";
+      finalEntityId = requestedBy;
+    }
+
+    if (
+      isTargeted &&
+      type === "share_request"
+    ) {
+      finalCategory = "member";
+      finalSeverity = "info";
+      finalTitle = "Lời mời chia sẻ nhà";
+      finalMessage =
+        `${actorName} đã mời bạn tham gia nhà "${homeName}".`;
+      finalEntityType = "home";
+      finalEntityId = homeId;
+    }
+
+    if (
+      isTargeted &&
+      type === "join_request"
+    ) {
+      finalCategory = "member";
+      finalSeverity = "info";
+      finalTitle = "Yêu cầu gia nhập nhà";
+      finalMessage =
+        `${actorName} đang xin gia nhập nhà "${homeName}".`;
+      finalEntityType = "member";
+      finalEntityId = requestedBy;
+    }
+
+    if (
+      isTargeted &&
+      type === "transfer_owner_request"
+    ) {
+      finalCategory = "member";
+      finalSeverity = "info";
+      finalTitle = "Yêu cầu chuyển quyền chủ nhà";
+      finalMessage =
+        `${actorName} muốn chuyển quyền chủ nhà "${homeName}" cho bạn.`;
+      finalEntityType = "home";
+      finalEntityId = homeId;
+    }
+
+    const recipientUids = new Set();
+
+    if (isTargeted) {
+      recipientUids.add(recipientUid);
+    } else {
+      recipientUids.add(ownerUid);
 
       const sharedSnap = await db
         .ref(`sharedByHome/${homeId}`)
         .once("value");
 
-      const sharedUsers = sharedSnap.val() || {};
+      const sharedUsers =
+        sharedSnap.val() || {};
 
       for (const sharedUid of Object.keys(sharedUsers)) {
-        await db
+        const membershipSnap = await db
           .ref(
-            `accounts/${sharedUid}/sharedHomes/${homeId}/alarmPauseToday`,
+            `accounts/${sharedUid}/sharedHomes/${homeId}`,
           )
-          .remove();
+          .once("value");
+
+        const membership =
+          membershipSnap.val() || {};
+
+        if (membership.ownerUid === ownerUid) {
+          recipientUids.add(sharedUid);
+        }
       }
 
-      await snap.ref.remove();
+      if (
+        isMemberLeave ||
+        req.includeActor !== true
+      ) {
+        recipientUids.delete(requestedBy);
+      }
+    }
 
-      console.log(
-        "🧹 ALARM PAUSE REMOVED:",
-        ownerUid,
+    for (const targetUid of recipientUids) {
+      await addHomeNotificationFromBackend({
+        uid: targetUid,
         homeId,
+        homeName,
+        type: finalType,
+        category: finalCategory,
+        severity: finalSeverity,
+        title: finalTitle,
+        message: finalMessage,
+        entityType: finalEntityType,
+        entityId: finalEntityId,
+      });
+    }
+
+    if (
+      !isTargeted &&
+      req.writeHomeTimeline === true
+    ) {
+      const eventsRef = db.ref(
+        `accounts/${ownerUid}/homes/${homeId}/events`,
       );
 
-      return;
+      const eventRef = eventsRef.push();
+
+      await eventRef.set({
+        time: Date.now(),
+        text: finalMessage,
+        type: finalType,
+        senderUid: requestedBy,
+        senderName: actorName,
+        senderRole: role,
+        deviceId: deviceId || "",
+        deviceName:
+          deviceId &&
+          home.devices &&
+          home.devices[deviceId]
+            ? String(
+                home.devices[deviceId].name ||
+                deviceId,
+              )
+            : "",
+      });
+
+      const eventsSnap = await eventsRef
+        .orderByChild("time")
+        .once("value");
+
+      const events =
+        eventsSnap.val() || {};
+
+      const entries =
+        Object.entries(events);
+
+      if (entries.length > 200) {
+        entries.sort((a, b) => {
+          return (
+            Number(a[1]?.time || 0) -
+            Number(b[1]?.time || 0)
+          );
+        });
+
+        const updates = {};
+        const removeCount =
+          entries.length - 200;
+
+        for (
+          const [eventId] of entries.slice(
+            0,
+            removeCount,
+          )
+        ) {
+          updates[eventId] = null;
+        }
+
+        await eventsRef.update(updates);
+      }
     }
 
-    if (!date || !start || !end) {
-      await snap.ref.remove();
-      return;
-    }
+    await snap.ref.remove();
 
-    const pauseData = {
-      date,
-      start,
-      end,
-      reason: reason || "",
-      createdByUid: createdByUid || "",
-      createdByName: createdByName || "",
-      createdAt: Date.now(),
-    };
-
-    await db
-      .ref(`accounts/${ownerUid}/homes/${homeId}/alarmPauseToday`)
-      .set(pauseData);
     console.log(
-      "PAUSE DEBUG:",
-      ownerUid,
-      createdByUid,
-      createdByName,
+      "✅ HOME NOTIFICATION REQUEST APPLIED:",
+      requestId,
+      requestedBy,
+      role,
+      finalType,
+      recipientUids.size,
     );
+  } catch (err) {
+    console.log(
+      "HOME NOTIFICATION REQUEST ERROR:",
+      requestId,
+      err.message,
+    );
+
+    try {
+      await snap.ref.remove();
+    } catch (_) {}
+  } finally {
+    if (requestId) {
+      homeNotificationRequestInProgress.delete(
+        requestId,
+      );
+    }
+  }
+});
+const transferOwnerAcceptInProgress = new Set();
+
+function normalizeHomeOrder(rawOrder) {
+  if (Array.isArray(rawOrder)) {
+    return rawOrder
+      .filter((value) => value != null)
+      .map((value) => String(value))
+      .filter((value) => value.length > 0);
+  }
+
+  if (
+    rawOrder &&
+    typeof rawOrder === "object"
+  ) {
+    return Object.keys(rawOrder)
+      .sort((a, b) => Number(a) - Number(b))
+      .map((key) => rawOrder[key])
+      .filter((value) => value != null)
+      .map((value) => String(value))
+      .filter((value) => value.length > 0);
+  }
+
+  return [];
+}
+
+db.ref("transfer_owner_accept_requests").on(
+  "child_added",
+  async (snap) => {
+    const req = snap.val();
+    const requestId = snap.key;
+
+    async function finishRequest(
+      status,
+      errorMessage = "",
+    ) {
+      try {
+        const result = {
+          status,
+          processedAt: Date.now(),
+        };
+
+        if (errorMessage) {
+          result.error = errorMessage;
+        }
+
+        await snap.ref.update(result);
+
+        setTimeout(async () => {
+          try {
+            await snap.ref.remove();
+          } catch (_) {}
+        }, 30000);
+      } catch (_) {}
+    }
+
+    try {
+      if (!req || !requestId) {
+        return;
+      }
+
+      if (
+        transferOwnerAcceptInProgress.has(
+          requestId,
+        )
+      ) {
+        return;
+      }
+
+      transferOwnerAcceptInProgress.add(
+        requestId,
+      );
+
+      const requestedByUid = String(
+        req.requestedByUid || "",
+      ).trim();
+
+      const oldOwnerUid = String(
+        req.oldOwnerUid || "",
+      ).trim();
+
+      const newOwnerUid = String(
+        req.newOwnerUid || "",
+      ).trim();
+
+      const homeId = String(
+        req.homeId || "",
+      ).trim();
+
+      const requestTime = Number(req.time);
+      const now = Date.now();
+
+      const invalidRequest =
+        req.status !== "pending" ||
+        requestedByUid.length === 0 ||
+        oldOwnerUid.length === 0 ||
+        newOwnerUid.length === 0 ||
+        homeId.length === 0 ||
+        requestedByUid !== newOwnerUid ||
+        oldOwnerUid === newOwnerUid ||
+        !Number.isFinite(requestTime) ||
+        requestTime > now + 1000 ||
+        requestTime < now - 5 * 60 * 1000;
+
+      if (invalidRequest) {
+        await finishRequest(
+          "rejected",
+          "INVALID DATA",
+        );
+        return;
+      }
+
+      const transferRequestKey =
+        `transfer_${homeId}_${oldOwnerUid}`;
+
+      const [
+        oldHomeSnap,
+        targetHomeSnap,
+        transferRequestSnap,
+        sharedByHomeSnap,
+        oldShareListSnap,
+        oldOwnerDirectorySnap,
+        newOwnerAccountSnap,
+        newOwnerOrderSnap,
+      ] = await Promise.all([
+        db
+          .ref(
+            `accounts/${oldOwnerUid}/homes/${homeId}`,
+          )
+          .once("value"),
+
+        db
+          .ref(
+            `accounts/${newOwnerUid}/homes/${homeId}`,
+          )
+          .once("value"),
+
+        db
+          .ref(
+            `accounts/${newOwnerUid}/shareRequests/${transferRequestKey}`,
+          )
+          .once("value"),
+
+        db
+          .ref(`sharedByHome/${homeId}`)
+          .once("value"),
+
+        db
+          .ref(
+            `accounts/${oldOwnerUid}/shareList/${homeId}`,
+          )
+          .once("value"),
+
+        db
+          .ref(
+            `userDirectory/${oldOwnerUid}`,
+          )
+          .once("value"),
+
+        db
+          .ref(`accounts/${newOwnerUid}`)
+          .once("value"),
+
+        db
+          .ref(
+            `accounts/${newOwnerUid}/homeOrder`,
+          )
+          .once("value"),
+      ]);
+
+      if (
+        !oldHomeSnap.exists() ||
+        !newOwnerAccountSnap.exists()
+      ) {
+        await finishRequest(
+          "rejected",
+          "ACCOUNT OR HOME NOT FOUND",
+        );
+        return;
+      }
+
+      if (targetHomeSnap.exists()) {
+        await finishRequest(
+          "rejected",
+          "TARGET HOME ALREADY EXISTS",
+        );
+        return;
+      }
+
+      const transferRequest =
+        transferRequestSnap.val() || {};
+
+      const validTransferRequest =
+        transferRequest.type ===
+          "transfer_owner_request" &&
+        transferRequest.homeId === homeId &&
+        transferRequest.oldOwnerUid ===
+          oldOwnerUid &&
+        transferRequest.newOwnerUid ===
+          newOwnerUid;
+
+      if (!validTransferRequest) {
+        await finishRequest(
+          "rejected",
+          "TRANSFER REQUEST NOT FOUND",
+        );
+        return;
+      }
+
+      const homeData =
+        oldHomeSnap.val() || {};
+
+      const storedOwnerUid = String(
+        homeData._ownerUid || "",
+      ).trim();
+
+      if (storedOwnerUid !== oldOwnerUid) {
+        await finishRequest(
+          "rejected",
+          "OWNER MISMATCH",
+        );
+        return;
+      }
+
+      const migratedHome = {
+        ...homeData,
+        _ownerUid: newOwnerUid,
+        _shared: false,
+      };
+
+      const sharedByHome =
+        sharedByHomeSnap.val() || {};
+
+      const oldShareList =
+        oldShareListSnap.val() || {};
+
+      const oldOwnerDirectory =
+        oldOwnerDirectorySnap.val() || {};
+
+      const oldOwnerMemberData = {
+        role: "member",
+        email: String(
+          oldOwnerDirectory.email || "",
+        ),
+        name: String(
+          oldOwnerDirectory.name || "",
+        ),
+        photoUrl: String(
+          oldOwnerDirectory.photoUrl || "",
+        ),
+        sharedAt: Date.now(),
+      };
+
+      const oldOwnerSharedHome = {
+        ownerUid: newOwnerUid,
+        role: "member",
+      };
+
+      if (homeData.alarmPauseToday) {
+        oldOwnerSharedHome.alarmPauseToday =
+          homeData.alarmPauseToday;
+      }
+
+      const newShareList = {};
+
+      for (
+        const [memberUid, rawMember]
+        of Object.entries(sharedByHome)
+      ) {
+        if (
+          memberUid === newOwnerUid ||
+          memberUid === oldOwnerUid
+        ) {
+          continue;
+        }
+
+        const memberData =
+          rawMember &&
+          typeof rawMember === "object"
+            ? rawMember
+            : {};
+
+        const oldListData =
+          oldShareList[memberUid] &&
+          typeof oldShareList[memberUid] ===
+            "object"
+            ? oldShareList[memberUid]
+            : {};
+
+        newShareList[memberUid] = {
+          ...memberData,
+          ...oldListData,
+          role:
+            memberData.role ||
+            oldListData.role ||
+            "member",
+        };
+      }
+
+      newShareList[oldOwnerUid] = {
+        ...oldOwnerMemberData,
+      };
+
+      const newOwnerOrder =
+        normalizeHomeOrder(
+          newOwnerOrderSnap.val(),
+        );
+
+      if (!newOwnerOrder.includes(homeId)) {
+        newOwnerOrder.push(homeId);
+      }
+
+      const updates = {
+        [`accounts/${newOwnerUid}/homes/${homeId}`]:
+          migratedHome,
+
+        [`accounts/${oldOwnerUid}/homes/${homeId}`]:
+          null,
+
+        [`accounts/${newOwnerUid}/sharedHomes/${homeId}`]:
+          null,
+
+        [`accounts/${oldOwnerUid}/sharedHomes/${homeId}`]:
+          oldOwnerSharedHome,
+
+        [`sharedByHome/${homeId}/${newOwnerUid}`]:
+          null,
+
+        [`sharedByHome/${homeId}/${oldOwnerUid}`]:
+          oldOwnerMemberData,
+
+        [`accounts/${oldOwnerUid}/shareList/${homeId}`]:
+          null,
+
+        [`accounts/${newOwnerUid}/shareList/${homeId}`]:
+          newShareList,
+
+        [`accounts/${newOwnerUid}/homeOrder`]:
+          newOwnerOrder,
+
+        [`accounts/${newOwnerUid}/customRules/${homeId}`]:
+          null,
+      };
+
+      for (
+        const memberUid
+        of Object.keys(sharedByHome)
+      ) {
+        if (
+          memberUid === newOwnerUid ||
+          memberUid === oldOwnerUid
+        ) {
+          continue;
+        }
+
+        updates[
+          `accounts/${memberUid}/sharedHomes/${homeId}/ownerUid`
+        ] = newOwnerUid;
+      }
+
+      const devices =
+        homeData.devices &&
+        typeof homeData.devices === "object"
+          ? homeData.devices
+          : {};
+
+      for (
+        const deviceId
+        of Object.keys(devices)
+      ) {
+        updates[
+          `system/devices_by_ieee/${deviceId}/uid`
+        ] = newOwnerUid;
+
+        updates[
+          `system/devices_by_ieee/${deviceId}/homeId`
+        ] = homeId;
+      }
+
+      await db.ref().update(updates);
+
+      for (
+        const deviceId
+        of Object.keys(devices)
+      ) {
+        deviceMap[deviceId] = {
+          uid: newOwnerUid,
+          homeId,
+        };
+      }
+
+      await finishRequest("completed");
+
+      console.log(
+        "👑 TRANSFER OWNER COMPLETED:",
+        oldOwnerUid,
+        "→",
+        newOwnerUid,
+        homeId,
+      );
+    } catch (err) {
+      console.log(
+        "TRANSFER OWNER ACCEPT ERROR:",
+        requestId,
+        err.message,
+      );
+
+      await finishRequest(
+        "rejected",
+        err.message || "UNKNOWN ERROR",
+      );
+    } finally {
+      if (requestId) {
+        transferOwnerAcceptInProgress.delete(
+          requestId,
+        );
+      }
+    }
+  },
+);
+db.ref("alarm_pause_requests").on("child_added", async (snap) => {
+  const req = snap.val();
+  const requestId = snap.key;
+
+  async function reject(reason) {
+    console.log(
+      "❌ ALARM PAUSE REQUEST REJECTED:",
+      requestId,
+      reason,
+    );
+
+    try {
+      await snap.ref.remove();
+    } catch (_) { }
+  }
+
+  try {
+    if (!req || !requestId) {
+      return;
+    }
+
+    const ownerUid = String(
+      req.ownerUid || "",
+    ).trim();
+
+    const homeId = String(
+      req.homeId || "",
+    ).trim();
+
+    const createdByUid = String(
+      req.createdByUid || "",
+    ).trim();
+
+    const action = String(
+      req.action || "create",
+    ).trim();
+
+    const createdAt = Number(req.createdAt);
+    const now = Date.now();
+
+    if (
+      req.status !== "pending" ||
+      ownerUid.length === 0 ||
+      homeId.length === 0 ||
+      createdByUid.length === 0 ||
+      !requestId.endsWith(`_${createdByUid}`) ||
+      !Number.isFinite(createdAt) ||
+      createdAt > now + 1000 ||
+      createdAt < now - 5 * 60 * 1000 ||
+      (action !== "create" && action !== "remove")
+    ) {
+      await reject("INVALID DATA");
+      return;
+    }
+
+    const homeSnap = await db
+      .ref(`accounts/${ownerUid}/homes/${homeId}`)
+      .once("value");
+
+    if (!homeSnap.exists()) {
+      await reject("HOME NOT FOUND");
+      return;
+    }
+
+    const home = homeSnap.val() || {};
+
+    let hasPermission = createdByUid === ownerUid;
+
+    if (!hasPermission) {
+      const [sharedHomeSnap, sharedMemberSnap] =
+        await Promise.all([
+          db
+            .ref(
+              `accounts/${createdByUid}/sharedHomes/${homeId}`,
+            )
+            .once("value"),
+
+          db
+            .ref(
+              `sharedByHome/${homeId}/${createdByUid}`,
+            )
+            .once("value"),
+        ]);
+
+      const sharedHome = sharedHomeSnap.val() || {};
+
+      hasPermission =
+        sharedHome.ownerUid === ownerUid &&
+        sharedMemberSnap.exists();
+    }
+
+    if (!hasPermission) {
+      await reject("NO PERMISSION");
+      return;
+    }
+
+    const actorSnap = await db
+      .ref(`accounts/${createdByUid}`)
+      .once("value");
+
+    const actor = actorSnap.val() || {};
+    const actorProfile = actor.profile || {};
+
+    const trustedActorName =
+      String(
+        actorProfile.name ||
+        actor.name ||
+        actor.email ||
+        "Một thành viên",
+      ).trim() || "Một thành viên";
+
     const sharedSnap = await db
       .ref(`sharedByHome/${homeId}`)
       .once("value");
 
     const sharedUsers = sharedSnap.val() || {};
 
-    for (const sharedUid of Object.keys(sharedUsers)) {
-      await db
-        .ref(
-          `accounts/${sharedUid}/sharedHomes/${homeId}/alarmPauseToday`,
-        )
-        .set(pauseData);
+    if (action === "remove") {
+      const updates = {
+        [`accounts/${ownerUid}/homes/${homeId}/alarmPauseToday`]:
+          null,
+
+        [`alarm_pause_requests/${requestId}`]:
+          null,
+      };
+
+      for (const sharedUid of Object.keys(sharedUsers)) {
+        if (sharedUid === ownerUid) {
+          continue;
+        }
+
+        updates[
+          `accounts/${sharedUid}/sharedHomes/${homeId}/alarmPauseToday`
+        ] = null;
+      }
+
+      await db.ref().update(updates);
+
+      console.log(
+        "🧹 ALARM PAUSE REMOVED:",
+        ownerUid,
+        homeId,
+        createdByUid,
+      );
+
+      return;
     }
 
-    await snap.ref.remove();
+    const date = String(req.date || "").trim();
+    const start = String(req.start || "").trim();
+    const end = String(req.end || "").trim();
+    const reason = String(req.reason || "").trim();
 
-    console.log("⏸️ ALARM PAUSE REQUEST APPLIED:", ownerUid, homeId);
+    if (
+      date !== getTodayKey() ||
+      !isValidHHMM(start) ||
+      !isValidHHMM(end) ||
+      start === end ||
+      reason.length > 120
+    ) {
+      await reject("INVALID PAUSE DATA");
+      return;
+    }
+
+    const devices = home.devices || {};
+
+    const enabledAlarms = Object.values(devices)
+      .map((device) => device?.alarm)
+      .filter((alarm) => {
+        return (
+          alarm &&
+          alarm.enabled === true &&
+          isValidHHMM(alarm.start) &&
+          isValidHHMM(alarm.end)
+        );
+      });
+
+    const insideAlarmRange = enabledAlarms.some((alarm) => {
+      return isPauseInsideAlarm(
+        alarm.start,
+        alarm.end,
+        start,
+        end,
+      );
+    });
+
+    if (!insideAlarmRange) {
+      await reject("OUTSIDE ALARM RANGE");
+      return;
+    }
+
+    const trustedHomeName =
+      String(home.name || "").trim() || homeId;
+
+    const pauseData = {
+      date,
+      start,
+      end,
+      homeName: trustedHomeName,
+      reason,
+      createdByUid,
+      createdByName: trustedActorName,
+      createdAt: Date.now(),
+    };
+
+    const updates = {
+      [`accounts/${ownerUid}/homes/${homeId}/alarmPauseToday`]:
+        pauseData,
+
+      [`alarm_pause_requests/${requestId}`]:
+        null,
+    };
+
+    for (const sharedUid of Object.keys(sharedUsers)) {
+      if (sharedUid === ownerUid) {
+        continue;
+      }
+
+      updates[
+        `accounts/${sharedUid}/sharedHomes/${homeId}/alarmPauseToday`
+      ] = pauseData;
+    }
+
+    await db.ref().update(updates);
+
+    console.log(
+      "⏸️ ALARM PAUSE REQUEST APPLIED:",
+      ownerUid,
+      homeId,
+      createdByUid,
+    );
   } catch (err) {
-    console.log("ALARM PAUSE REQUEST ERROR:", err.message);
+    console.log(
+      "ALARM PAUSE REQUEST ERROR:",
+      err.message,
+    );
+
+    try {
+      await snap.ref.remove();
+    } catch (_) { }
   }
 });
 db.ref("accounts").on("child_changed", async (snap) => {
@@ -1843,46 +3088,195 @@ db.ref("pair_requests").on("child_added", async (snap) => {
   const data = snap.val();
   const key = snap.key;
 
-  if (!data) return;
+  if (!data || !key) return;
+
+  const rawDuration = Number(data.duration);
+
+  const cleanupSeconds =
+    Number.isFinite(rawDuration) &&
+      rawDuration >= 1 &&
+      rawDuration <= 60
+      ? rawDuration
+      : 60;
 
   setTimeout(async () => {
     try {
-      await db.ref(`pair_requests/${key}`).remove();
+      if (pairingSession?.key === key) {
+        await setPermitJoin(false);
+        pairingSession = null;
+      }
+
+      await snap.ref.remove();
+
       console.log("🧹 PAIR REQUEST REMOVED:", key);
-    } catch (e) {
-      console.log("❌ REMOVE ERROR:", e.message);
+    } catch (err) {
+      console.log(
+        "PAIR REQUEST CLEANUP ERROR:",
+        err.message,
+      );
     }
-  }, (data.duration || 60) * 1000);
+  }, cleanupSeconds * 1000);
 
-  if (data.active !== true) return;
+  try {
+    const requestedBy = String(
+      data.requestedBy || "",
+    ).trim();
 
-  if ((data.hubId || "").trim() !== DEVICE_ID.trim()) return;
+    const ownerUid = String(
+      data.ownerUid || "",
+    ).trim();
 
-  if (pairingSession?.key === key) return;
+    const homeId = String(
+      data.homeId || "",
+    ).trim();
 
-  console.log("🟢 PAIR START:", key, data.homeId);
+    const hubId = String(
+      data.hubId || "",
+    ).trim();
 
-  if (!data?.requestedBy || !data?.homeId) {
-    console.log("❌ INVALID PAIR REQUEST DATA", data);
-    return;
+    const roomId = String(
+      data.roomId || "unassigned",
+    ).trim();
+
+    const duration = Number(data.duration);
+    const requestTime = Number(data.time);
+    const now = Date.now();
+
+    const invalidRequest =
+      data.active !== true ||
+      requestedBy.length === 0 ||
+      ownerUid.length === 0 ||
+      homeId.length === 0 ||
+      hubId.length === 0 ||
+      roomId.length === 0 ||
+      !Number.isFinite(duration) ||
+      duration < 1 ||
+      duration > 60 ||
+      !Number.isFinite(requestTime) ||
+      requestTime > now + 1000 ||
+      requestTime < now - 5 * 60 * 1000;
+
+    if (invalidRequest) {
+      console.log(
+        "❌ PAIR REQUEST REJECTED: INVALID DATA",
+        key,
+      );
+
+      await snap.ref.remove();
+      return;
+    }
+
+    // Request dành cho Raspberry Pi khác.
+    if (hubId !== DEVICE_ID.trim()) {
+      return;
+    }
+
+    const homeSnap = await db
+      .ref(`accounts/${ownerUid}/homes/${homeId}`)
+      .once("value");
+
+    if (!homeSnap.exists()) {
+      console.log(
+        "❌ PAIR REQUEST REJECTED: HOME NOT FOUND",
+        key,
+      );
+
+      await snap.ref.remove();
+      return;
+    }
+
+    let hasPermission = requestedBy === ownerUid;
+
+    if (!hasPermission) {
+      const sharedSnap = await db
+        .ref(
+          `accounts/${requestedBy}/sharedHomes/${homeId}`,
+        )
+        .once("value");
+
+      const sharedInfo = sharedSnap.val() || {};
+
+      hasPermission =
+        sharedInfo.ownerUid === ownerUid &&
+        sharedInfo.role === "admin";
+    }
+
+    if (!hasPermission) {
+      console.log(
+        "❌ PAIR REQUEST REJECTED: NO PERMISSION",
+        key,
+        requestedBy,
+      );
+
+      await snap.ref.remove();
+      return;
+    }
+
+    if (
+      roomId !== "unassigned" &&
+      !homeSnap
+        .child("rooms")
+        .child(roomId)
+        .exists()
+    ) {
+      console.log(
+        "❌ PAIR REQUEST REJECTED: ROOM NOT FOUND",
+        key,
+        roomId,
+      );
+
+      await snap.ref.remove();
+      return;
+    }
+
+    if (pairingSession?.key === key) {
+      return;
+    }
+
+    if (pairingSession != null) {
+      console.log(
+        "❌ PAIR REQUEST REJECTED: HUB BUSY",
+        key,
+      );
+
+      await snap.ref.remove();
+      return;
+    }
+
+    await setPermitJoin(true, duration);
+
+    pairingSession = {
+      key,
+      uid: ownerUid,
+      requestedBy,
+      homeId,
+      roomId,
+    };
+
+    console.log(
+      "🟢 PAIR START:",
+      key,
+      homeId,
+      requestedBy,
+    );
+  } catch (err) {
+    console.log(
+      "PAIR REQUEST PROCESS ERROR:",
+      err.message,
+    );
+
+    if (pairingSession?.key === key) {
+      try {
+        await setPermitJoin(false);
+      } catch (_) { }
+
+      pairingSession = null;
+    }
+
+    try {
+      await snap.ref.remove();
+    } catch (_) { }
   }
-
-  pairingSession = {
-    key,
-    uid: data.ownerUid || data.requestedBy,
-    requestedBy: data.requestedBy,
-    homeId: data.homeId,
-    roomId: data.roomId || "unassigned",
-  };
-
-  await setPermitJoin(true, data.duration || 60);
-
-  setTimeout(async () => {
-    await setPermitJoin(false);
-    pairingSession = null;
-
-    console.log("🧹 PAIR DONE:", key);
-  }, (data.duration || 60) * 1000);
 });
 
 db.ref("pair_requests").on("child_removed", (snap) => {
