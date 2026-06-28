@@ -13,6 +13,7 @@ const pendingEventAlarmTimerMap = {};
 const pendingScheduleReminderMap = {};
 const pendingScheduleReminderTimerMap = {};
 const userDirectoryCache = {};
+const processedChatNotificationMessages = new Set();
 function getPiSerial() {
   try {
     const cpuInfo = fs.readFileSync("/proc/cpuinfo", "utf8");
@@ -87,10 +88,10 @@ function isNowInRange(startTime, endTime) {
   const end = toMin(endTime || "06:00");
 
   if (start > end) {
-    return nowMin >= start || nowMin <= end;
+    return nowMin >= start || nowMin < end;
   }
 
-  return nowMin >= start && nowMin <= end;
+  return nowMin >= start && nowMin < end;
 }
 function getNextAlarmTimeText(repeatMinutes) {
   const minutes = parseInt(repeatMinutes || 0);
@@ -746,13 +747,10 @@ async function sendAlarmPauseNotification(
         clickAction: "schedule_SCREEN",
       },
 
+      // Data-only để app dùng đúng một notification Reminder
+      // ID 999998 và channel ưu tiên mới.
       android: {
         priority: "high",
-        notification: {
-          title: homeName || "Nhà",
-          body: text,
-          channelId: "safehome_schedule_fullscreen_channel",
-        },
       },
     });
 
@@ -1291,8 +1289,147 @@ async function addDeviceNotification(
 
 // ================= ALARM LOGIC =================
 
+function isSecurityDeviceType(deviceType) {
+  return (
+    deviceType === "door" ||
+    deviceType === "window" ||
+    deviceType === "gate" ||
+    deviceType === "lock" ||
+    deviceType === "door_lock" ||
+    deviceType === "motion"
+  );
+}
+
+function isEmergencyDeviceType(deviceType) {
+  return (
+    deviceType === "smoke" ||
+    deviceType === "gas" ||
+    deviceType === "water_leak" ||
+    deviceType === "flood" ||
+    deviceType === "sos"
+  );
+}
+
+function normalizeRepeatMinutes(value) {
+  const minutes = Number.parseInt(value || 0, 10);
+
+  if (!Number.isFinite(minutes) || minutes < 0) {
+    return 0;
+  }
+
+  return minutes;
+}
+
+function getScheduleAlarmKey(
+  receiverUid,
+  ownerUid,
+  homeId,
+  deviceId,
+  alarm,
+) {
+  return [
+    receiverUid,
+    ownerUid,
+    homeId,
+    deviceId,
+    String(alarm?.start || ""),
+    String(alarm?.end || ""),
+  ].join("_");
+}
+
+async function resolveDeviceAlarmForReceiver(
+  receiverUid,
+  homeId,
+  deviceId,
+  homeData,
+  receiverAccount = null,
+) {
+  let deviceAlarm =
+    homeData.devices?.[deviceId]?.alarm || null;
+
+  try {
+    let mode = "home";
+    let customAlarm = null;
+
+    if (receiverAccount) {
+      const customHomeRules =
+        receiverAccount.customRules?.[homeId] || {};
+
+      mode = String(customHomeRules.mode || "home");
+      customAlarm =
+        customHomeRules.devices?.[deviceId]?.alarm || null;
+    } else {
+      const modeSnap = await db
+        .ref(
+          `accounts/${receiverUid}/customRules/${homeId}/mode`,
+        )
+        .once("value");
+
+      mode = String(modeSnap.val() || "home");
+
+      if (mode === "custom") {
+        const customAlarmSnap = await db
+          .ref(
+            `accounts/${receiverUid}/customRules/${homeId}/devices/${deviceId}/alarm`,
+          )
+          .once("value");
+
+        customAlarm = customAlarmSnap.val();
+      }
+    }
+
+    // Chế độ Riêng tôi chỉ ghi đè sensor đã có cài đặt riêng.
+    // Sensor chưa có cài đặt riêng tiếp tục kế thừa lịch của nhà.
+    if (mode === "custom" && customAlarm) {
+      deviceAlarm = customAlarm;
+    }
+  } catch (error) {
+    console.log(
+      "CUSTOM DEVICE ALARM LOAD ERROR:",
+      receiverUid,
+      homeId,
+      deviceId,
+      error.message,
+    );
+  }
+
+  if (!deviceAlarm || typeof deviceAlarm !== "object") {
+    return null;
+  }
+
+  return deviceAlarm;
+}
+
+function getUnsafeSecurityReason(
+  deviceName,
+  deviceType,
+  device,
+) {
+  if (device.tamper === true) {
+    return `${deviceName}: Thiết bị bị tháo`;
+  }
+
+  if (
+    deviceType === "motion" &&
+    (
+      device.occupancy === true ||
+      device.motion === true ||
+      device.presence === true
+    )
+  ) {
+    return `${deviceName}: Phát hiện chuyển động`;
+  }
+
+  if (device.contact === false) {
+    return `${deviceName}: Cửa đang mở`;
+  }
+
+  return "";
+}
+
 async function processScheduleAlarmsForOwner(
-  uid,
+  receiverUid,
+  ownerUid,
   homeId,
   homeName,
   deviceId,
@@ -1301,49 +1438,26 @@ async function processScheduleAlarmsForOwner(
   homeData,
   updateData,
 ) {
-  let deviceAlarm =
-    homeData.devices?.[deviceId]?.alarm || null;
+  const oldDevice =
+    homeData.devices?.[deviceId] || {};
 
-  try {
-    const modeSnap = await db
-      .ref(`accounts/${uid}/customRules/${homeId}/mode`)
-      .once("value");
-
-    const mode = modeSnap.val();
-
-    if (mode === "custom") {
-      const customAlarmSnap = await db
-        .ref(
-          `accounts/${uid}/customRules/${homeId}/devices/${deviceId}/alarm`
-        )
-        .once("value");
-
-      const customAlarm = customAlarmSnap.val();
-
-      if (customAlarm) {
-        deviceAlarm = customAlarm;
-      }
-    }
-  } catch (e) {
-    console.log("CUSTOM ALARM LOAD ERROR:", e.message);
-  }
-  const isSecurityDevice =
-    deviceType === "door" ||
-    deviceType === "door_lock" ||
-    deviceType === "motion";
-
-  const isEmergencyDevice =
-    deviceType === "smoke" ||
-    deviceType === "gas" ||
-    deviceType === "water_leak" ||
-    deviceType === "sos";
-  if (!isSecurityDevice && !isEmergencyDevice) {
+  if (
+    !isSecurityDeviceType(deviceType) &&
+    !isEmergencyDeviceType(deviceType)
+  ) {
     return;
   }
-  // các loại khác không kích hoạt alarm
-  if (isEmergencyDevice) {
-    if (updateData.smoke === true) {
-      queueEventAlarm(uid, {
+
+  // Khói, SOS, gas và ngập luôn cảnh báo,
+  // không phụ thuộc Mode hoặc lịch của sensor.
+  if (isEmergencyDeviceType(deviceType)) {
+    if (
+      deviceType === "smoke" &&
+      updateData.smoke === true &&
+      oldDevice.smoke !== true
+    ) {
+      queueEventAlarm(receiverUid, {
+        ownerUid,
         homeId,
         homeName,
         deviceName,
@@ -1352,11 +1466,16 @@ async function processScheduleAlarmsForOwner(
         repeatMinutes: 0,
         nextAlarm: "ngay lập tức",
       });
+
       return;
     }
 
-    if (updateData.action !== undefined) {
-      queueEventAlarm(uid, {
+    if (
+      deviceType === "sos" &&
+      updateData.action !== undefined
+    ) {
+      queueEventAlarm(receiverUid, {
+        ownerUid,
         homeId,
         homeName,
         deviceName,
@@ -1365,11 +1484,77 @@ async function processScheduleAlarmsForOwner(
         repeatMinutes: 0,
         nextAlarm: "ngay lập tức",
       });
+
       return;
     }
 
-    if (updateData.tamper === true) {
-      queueEventAlarm(uid, {
+    if (
+      deviceType === "gas" &&
+      (
+        (
+          updateData.gas === true &&
+          oldDevice.gas !== true
+        ) ||
+        (
+          updateData.gas_alarm === true &&
+          oldDevice.gas_alarm !== true
+        )
+      )
+    ) {
+      queueEventAlarm(receiverUid, {
+        ownerUid,
+        homeId,
+        homeName,
+        deviceName,
+        type: deviceType,
+        reason: `${deviceName}: Phát hiện rò rỉ gas`,
+        repeatMinutes: 0,
+        nextAlarm: "ngay lập tức",
+      });
+
+      return;
+    }
+
+    if (
+      (
+        deviceType === "water_leak" ||
+        deviceType === "flood"
+      ) &&
+      (
+        (
+          updateData.water_leak === true &&
+          oldDevice.water_leak !== true
+        ) ||
+        (
+          updateData.leak === true &&
+          oldDevice.leak !== true
+        ) ||
+        (
+          updateData.water === true &&
+          oldDevice.water !== true
+        )
+      )
+    ) {
+      queueEventAlarm(receiverUid, {
+        ownerUid,
+        homeId,
+        homeName,
+        deviceName,
+        type: deviceType,
+        reason: `${deviceName}: Phát hiện ngập nước`,
+        repeatMinutes: 0,
+        nextAlarm: "ngay lập tức",
+      });
+
+      return;
+    }
+
+    if (
+      updateData.tamper === true &&
+      oldDevice.tamper !== true
+    ) {
+      queueEventAlarm(receiverUid, {
+        ownerUid,
         homeId,
         homeName,
         deviceName,
@@ -1378,171 +1563,268 @@ async function processScheduleAlarmsForOwner(
         repeatMinutes: 0,
         nextAlarm: "ngay lập tức",
       });
+    }
+
+    return;
+  }
+
+  const deviceAlarm =
+    await resolveDeviceAlarmForReceiver(
+      receiverUid,
+      homeId,
+      deviceId,
+      homeData,
+    );
+
+  const manualArmed =
+    homeData.securityMode === "armed";
+
+  const scheduleArmed =
+    deviceAlarm?.enabled === true &&
+    isNowInRange(
+      deviceAlarm.start,
+      deviceAlarm.end,
+    );
+
+  // Mode Bảo vệ thủ công bảo vệ toàn bộ sensor.
+  // Mode Bình thường chỉ bảo vệ sensor đang nằm trong lịch riêng.
+  if (!manualArmed && !scheduleArmed) {
+    return;
+  }
+
+  const repeatMinutes = scheduleArmed
+    ? normalizeRepeatMinutes(
+        deviceAlarm?.repeatMinutes,
+      )
+    : 0;
+
+  const nextAlarm = scheduleArmed
+    ? getNextAlarmTimeText(repeatMinutes)
+    : "không lặp lại";
+
+  function rememberScheduleTrigger() {
+    if (!scheduleArmed) {
       return;
     }
-  }
-  if (!isSecurityDevice) {
-    return;
-  }
 
-  if (!deviceAlarm || deviceAlarm.enabled !== true) {
-    return;
-  }
+    const alarmKey = getScheduleAlarmKey(
+      receiverUid,
+      ownerUid,
+      homeId,
+      deviceId,
+      deviceAlarm,
+    );
 
-  const inTime = isNowInRange(
-    deviceAlarm.start,
-    deviceAlarm.end,
-  );
-
-  if (!inTime) {
-    return;
+    lastScheduleAlarmMap[alarmKey] = Date.now();
   }
 
-  const oldDevice = homeData.devices?.[deviceId] || {};
-  const oldContact = oldDevice.contact;
-  const oldTamper = oldDevice.tamper;
+  if (
+    updateData.contact === false &&
+    oldDevice.contact !== false
+  ) {
+    rememberScheduleTrigger();
 
-  if (updateData.contact === false && oldContact !== false) {
-    queueEventAlarm(uid, {
+    queueEventAlarm(receiverUid, {
+      ownerUid,
       homeId,
       homeName,
       deviceName,
       type: deviceType,
       reason: `${deviceName}: Cửa mở bất thường`,
-      repeatMinutes: 0,
-      nextAlarm: getNextAlarmTimeText(deviceAlarm.repeatMinutes),
+      repeatMinutes,
+      nextAlarm,
     });
+
     return;
   }
 
-  if (updateData.tamper === true && oldTamper !== true) {
-    queueEventAlarm(uid, {
+  if (
+    updateData.tamper === true &&
+    oldDevice.tamper !== true
+  ) {
+    rememberScheduleTrigger();
+
+    queueEventAlarm(receiverUid, {
+      ownerUid,
       homeId,
       homeName,
       deviceName,
       type: deviceType,
       reason: `${deviceName}: Thiết bị bị tháo`,
-      repeatMinutes: 0,
-      nextAlarm: getNextAlarmTimeText(deviceAlarm.repeatMinutes),
+      repeatMinutes,
+      nextAlarm,
     });
+
     return;
   }
+
+  const motionTriggered =
+    (
+      updateData.occupancy === true &&
+      oldDevice.occupancy !== true
+    ) ||
+    (
+      updateData.motion === true &&
+      oldDevice.motion !== true
+    ) ||
+    (
+      updateData.presence === true &&
+      oldDevice.presence !== true
+    );
+
+  if (
+    deviceType === "motion" &&
+    motionTriggered
+  ) {
+    rememberScheduleTrigger();
+
+    queueEventAlarm(receiverUid, {
+      ownerUid,
+      homeId,
+      homeName,
+      deviceName,
+      type: deviceType,
+      reason: `${deviceName}: Phát hiện chuyển động`,
+      repeatMinutes,
+      nextAlarm,
+    });
+  }
 }
+
 async function checkScheduledAlarms() {
-  console.log("🚨 CHECK ALARM SCHEDULE");
+  console.log("🚨 CHECK PER-DEVICE ALARM SCHEDULE");
 
   try {
-    const snap = await db.ref("accounts").once("value");
+    const snap = await db
+      .ref("accounts")
+      .once("value");
+
     const accounts = snap.val() || {};
-
     const now = Date.now();
-    const today = new Date().toDateString();
-
     const alarmSummaryByUser = {};
 
-    for (const [uid, user] of Object.entries(accounts)) {
-      const ownHomes = user.homes || {};
-      const sharedHomes = user.sharedHomes || {};
-
+    for (const [receiverUid, receiverAccount] of Object.entries(accounts)) {
+      const ownHomes = receiverAccount?.homes || {};
+      const sharedHomes = receiverAccount?.sharedHomes || {};
       const homesToCheck = [];
 
       for (const [homeId, home] of Object.entries(ownHomes)) {
         homesToCheck.push({
-          receiverUid: uid,
-          ownerUid: uid,
+          receiverUid,
+          ownerUid: receiverUid,
           homeId,
           home,
-          source: "owner",
         });
       }
 
       for (const [homeId, sharedInfo] of Object.entries(sharedHomes)) {
-        const ownerUid = sharedInfo?.ownerUid;
-        if (!ownerUid) continue;
+        const ownerUid = String(
+          sharedInfo?.ownerUid || "",
+        ).trim();
 
-        const homeSnap = await db
-          .ref(`accounts/${ownerUid}/homes/${homeId}`)
-          .once("value");
+        if (!ownerUid) {
+          continue;
+        }
 
-        const sharedHome = homeSnap.val();
-        if (!sharedHome) continue;
+        const sharedHome =
+          accounts[ownerUid]?.homes?.[homeId];
+
+        if (!sharedHome) {
+          continue;
+        }
 
         homesToCheck.push({
-          receiverUid: uid,
+          receiverUid,
           ownerUid,
           homeId,
           home: sharedHome,
-          source: "shared",
         });
       }
 
       for (const item of homesToCheck) {
-        const { receiverUid, ownerUid, homeId, home, source } = item;
+        const {
+          ownerUid,
+          homeId,
+          home,
+        } = item;
 
         const canReceive = await canReceiveAlarm(
           receiverUid,
           homeId,
           ownerUid,
         );
-        if (!canReceive) {
-          console.log("🔕 ALARM MUTED BY USER:", receiverUid, homeId);
-          continue;
-        }
 
-
-
-        const devices = home.devices || {};
+        const devices = home?.devices || {};
 
         for (const [deviceId, device] of Object.entries(devices)) {
-          const deviceType = device.type || "door";
+          const deviceType = String(
+            device?.type || "door",
+          ).trim();
 
-          const isSecurityDevice =
-            deviceType === "door" ||
-            deviceType === "door_lock" ||
-            deviceType === "motion";
-
-          if (!isSecurityDevice) continue;
-
-          let deviceAlarm = device.alarm;
-
-          try {
-            const modeSnap = await db
-              .ref(`accounts/${receiverUid}/customRules/${homeId}/mode`)
-              .once("value");
-
-            const mode = modeSnap.val();
-
-            if (mode === "custom") {
-              const customAlarmSnap = await db
-                .ref(
-                  `accounts/${receiverUid}/customRules/${homeId}/devices/${deviceId}/alarm`
-                )
-                .once("value");
-
-              const customAlarm = customAlarmSnap.val();
-
-              if (customAlarm) {
-                deviceAlarm = customAlarm;
-              }
-            }
-          } catch (e) {
-            console.log("CUSTOM SCHEDULE ALARM ERROR:", e.message);
+          if (!isSecurityDeviceType(deviceType)) {
+            continue;
           }
 
-          if (!deviceAlarm || deviceAlarm.enabled !== true) continue;
-          if (!isNowInRange(deviceAlarm.start, deviceAlarm.end)) continue;
+          const deviceAlarm =
+            await resolveDeviceAlarmForReceiver(
+              receiverUid,
+              homeId,
+              deviceId,
+              home,
+              receiverAccount,
+            );
 
-          const isUnsafe =
-            device.contact === false ||
-            device.tamper === true;
+          if (!deviceAlarm || deviceAlarm.enabled !== true) {
+            continue;
+          }
 
-          if (!isUnsafe) continue;
+          const alarmKey = getScheduleAlarmKey(
+            receiverUid,
+            ownerUid,
+            homeId,
+            deviceId,
+            deviceAlarm,
+          );
 
-          const repeatMinutes = parseInt(deviceAlarm.repeatMinutes || 0);
-          const alarmKey = `${receiverUid}_${ownerUid}_${homeId}_${deviceId}_${deviceAlarm.start}_${deviceAlarm.end}_${today}`;
-          const lastTime = lastScheduleAlarmMap[alarmKey] || 0;
+          if (
+            !isNowInRange(
+              deviceAlarm.start,
+              deviceAlarm.end,
+            )
+          ) {
+            delete lastScheduleAlarmMap[alarmKey];
+            continue;
+          }
 
-          if (repeatMinutes === 0 && lastTime > 0) continue;
+          if (!canReceive) {
+            continue;
+          }
+
+          const deviceName =
+            String(device?.name || deviceId);
+
+          const reason = getUnsafeSecurityReason(
+            deviceName,
+            deviceType,
+            device || {},
+          );
+
+          if (!reason) {
+            delete lastScheduleAlarmMap[alarmKey];
+            continue;
+          }
+
+          const repeatMinutes =
+            normalizeRepeatMinutes(
+              deviceAlarm.repeatMinutes,
+            );
+
+          const lastTime =
+            lastScheduleAlarmMap[alarmKey] || 0;
+
+          if (repeatMinutes === 0 && lastTime > 0) {
+            continue;
+          }
 
           if (
             repeatMinutes > 0 &&
@@ -1554,11 +1836,6 @@ async function checkScheduledAlarms() {
 
           lastScheduleAlarmMap[alarmKey] = now;
 
-          const deviceName = device.name || deviceId;
-          const reason = device.contact === false
-            ? `${deviceName}: Cửa đang mở`
-            : `${deviceName}: Thiết bị bị tháo`;
-
           if (!alarmSummaryByUser[receiverUid]) {
             alarmSummaryByUser[receiverUid] = [];
           }
@@ -1566,24 +1843,531 @@ async function checkScheduledAlarms() {
           alarmSummaryByUser[receiverUid].push({
             ownerUid,
             homeId,
-            homeName: home.name || homeId,
+            homeName: home?.name || homeId,
             deviceName,
             type: deviceType,
             reason,
             repeatMinutes,
-            nextAlarm: getNextAlarmTimeText(repeatMinutes),
+            nextAlarm:
+              getNextAlarmTimeText(repeatMinutes),
           });
         }
       }
     }
 
     for (const [receiverUid, items] of Object.entries(alarmSummaryByUser)) {
-      await sendAlarmSummary(receiverUid, items);
+      await sendAlarmSummary(
+        receiverUid,
+        items,
+      );
     }
-  } catch (err) {
-    console.log("ALARM CHECK ERROR:", err.message);
+  } catch (error) {
+    console.log(
+      "PER-DEVICE ALARM SCHEDULE ERROR:",
+      error.message,
+    );
   }
 }
+
+async function cleanupLegacySecurityScheduleState() {
+  try {
+    const snap = await db
+      .ref("accounts")
+      .once("value");
+
+    const accounts = snap.val() || {};
+    const updates = {};
+
+    for (const [ownerUid, account] of Object.entries(accounts)) {
+      const homes = account?.homes || {};
+
+      for (const [homeId, home] of Object.entries(homes)) {
+        if (home?.securityModeSource === "schedule") {
+          updates[
+            `accounts/${ownerUid}/homes/${homeId}/securityMode`
+          ] = "normal";
+
+          updates[
+            `accounts/${ownerUid}/homes/${homeId}/securityModeSource`
+          ] = null;
+        }
+
+        if (
+          Object.prototype.hasOwnProperty.call(
+            home || {},
+            "securityScheduleActive",
+          )
+        ) {
+          updates[
+            `accounts/${ownerUid}/homes/${homeId}/securityScheduleActive`
+          ] = null;
+        }
+      }
+    }
+
+    if (Object.keys(updates).length === 0) {
+      return;
+    }
+
+    await db.ref().update(updates);
+
+    console.log(
+      "🧹 LEGACY SECURITY SCHEDULE STATE CLEARED:",
+      Object.keys(updates).length,
+    );
+  } catch (error) {
+    console.log(
+      "LEGACY SECURITY SCHEDULE CLEANUP ERROR:",
+      error.message,
+    );
+  }
+}
+
+
+// ================= AUTO AWAY =================
+const AUTO_AWAY_ARM_DELAY_MS = 2 * 60 * 1000;
+const AUTO_AWAY_SCAN_INTERVAL_MS = 30 * 1000;
+
+let autoAwayTimer = null;
+let autoAwayScanRunning = false;
+
+function asObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value
+    : {};
+}
+
+function normalizePresenceState(
+  accounts,
+  memberUid,
+  ownerUid,
+  homeId,
+) {
+  const presence = asObject(
+    accounts?.[memberUid]?.homePresence?.[homeId],
+  );
+
+  const storedOwnerUid = String(
+    presence.ownerUid || "",
+  ).trim();
+
+  const storedHomeId = String(
+    presence.homeId || "",
+  ).trim();
+
+  const state = String(
+    presence.state || "unknown",
+  ).trim();
+
+  if (
+    storedOwnerUid !== ownerUid ||
+    storedHomeId !== homeId ||
+    (state !== "inside" && state !== "outside")
+  ) {
+    return "unknown";
+  }
+
+  return state;
+}
+
+function runtimeSignature(runtime) {
+  const value = asObject(runtime);
+
+  return JSON.stringify({
+    status: String(value.status || ""),
+    memberCount: Number(value.memberCount || 0),
+    insideCount: Number(value.insideCount || 0),
+    outsideCount: Number(value.outsideCount || 0),
+    unknownCount: Number(value.unknownCount || 0),
+    allOutsideSince: Number(value.allOutsideSince || 0),
+    cycleArmed: value.cycleArmed === true,
+  });
+}
+
+function buildRuntime({
+  status,
+  memberCount,
+  insideCount,
+  outsideCount,
+  unknownCount,
+  allOutsideSince,
+  cycleArmed,
+  now,
+}) {
+  return {
+    status,
+    memberCount,
+    insideCount,
+    outsideCount,
+    unknownCount,
+    allOutsideSince: allOutsideSince || null,
+    cycleArmed: cycleArmed === true,
+    updatedAt: now,
+  };
+}
+
+async function checkAutoAwayHomes(db) {
+  if (autoAwayScanRunning) {
+    return;
+  }
+
+  autoAwayScanRunning = true;
+
+  try {
+    const [accountsSnap, sharedByHomeSnap] =
+      await Promise.all([
+        db.ref("accounts").once("value"),
+        db.ref("sharedByHome").once("value"),
+      ]);
+
+    const accounts = accountsSnap.val() || {};
+    const sharedByHome = sharedByHomeSnap.val() || {};
+    const now = Date.now();
+    const updates = {};
+    const logs = [];
+
+    for (const [ownerUid, rawAccount] of Object.entries(accounts)) {
+      const account = asObject(rawAccount);
+      const homes = asObject(account.homes);
+
+      for (const [homeId, rawHome] of Object.entries(homes)) {
+        const home = asObject(rawHome);
+        const autoAway = asObject(home.autoAway);
+        const runtime = asObject(home.autoAwayRuntime);
+
+        const homePath =
+          `accounts/${ownerUid}/homes/${homeId}`;
+        const runtimePath =
+          `${homePath}/autoAwayRuntime`;
+
+        if (autoAway.enabled !== true) {
+          if (Object.keys(runtime).length > 0) {
+            updates[runtimePath] = null;
+          }
+
+          if (
+            home.securityMode === "armed" &&
+            home.securityModeSource === "auto_away"
+          ) {
+            updates[`${homePath}/securityMode`] = "normal";
+            updates[`${homePath}/securityModeSource`] = null;
+
+            logs.push(
+              `🏠 AUTO AWAY OFF → NORMAL: ${ownerUid} ${homeId}`,
+            );
+          }
+
+          continue;
+        }
+
+        const members = new Set([ownerUid]);
+        const sharedMembers = asObject(sharedByHome[homeId]);
+
+        for (const memberUid of Object.keys(sharedMembers)) {
+          if (memberUid.trim() !== "") {
+            members.add(memberUid);
+          }
+        }
+
+        const states = [];
+
+        for (const memberUid of members) {
+          states.push(
+            normalizePresenceState(
+              accounts,
+              memberUid,
+              ownerUid,
+              homeId,
+            ),
+          );
+        }
+
+        const memberCount = states.length;
+        const insideCount = states.filter(
+          (state) => state === "inside",
+        ).length;
+        const outsideCount = states.filter(
+          (state) => state === "outside",
+        ).length;
+        const unknownCount = memberCount - insideCount - outsideCount;
+
+        const anyInside = insideCount > 0;
+        const allOutside =
+          memberCount > 0 && outsideCount === memberCount;
+
+        let nextRuntime;
+
+        if (anyInside) {
+          nextRuntime = buildRuntime({
+            status: "inside",
+            memberCount,
+            insideCount,
+            outsideCount,
+            unknownCount,
+            allOutsideSince: 0,
+            cycleArmed: false,
+            now,
+          });
+
+          if (
+            home.securityMode === "armed" &&
+            home.securityModeSource === "auto_away"
+          ) {
+            updates[`${homePath}/securityMode`] = "normal";
+            updates[`${homePath}/securityModeSource`] = null;
+
+            logs.push(
+              `🏠 AUTO AWAY MEMBER RETURNED → NORMAL: ${ownerUid} ${homeId}`,
+            );
+          }
+        } else if (!allOutside) {
+          nextRuntime = buildRuntime({
+            status: "waiting_presence",
+            memberCount,
+            insideCount,
+            outsideCount,
+            unknownCount,
+            allOutsideSince: 0,
+            cycleArmed: runtime.cycleArmed === true,
+            now,
+          });
+        } else {
+          const storedSince = Number(
+            runtime.allOutsideSince || 0,
+          );
+
+          const allOutsideSince =
+            storedSince > 0 ? storedSince : now;
+
+          let cycleArmed = runtime.cycleArmed === true;
+          const elapsed = now - allOutsideSince;
+
+          if (
+            !cycleArmed &&
+            elapsed >= AUTO_AWAY_ARM_DELAY_MS
+          ) {
+            cycleArmed = true;
+
+            if (home.securityMode !== "armed") {
+              updates[`${homePath}/securityMode`] = "armed";
+              updates[`${homePath}/securityModeSource`] = "auto_away";
+
+              logs.push(
+                `🛡️ AUTO AWAY ARMED: ${ownerUid} ${homeId} members=${memberCount}`,
+              );
+            } else {
+              logs.push(
+                `🛡️ AUTO AWAY CYCLE READY, MODE ALREADY ARMED: ${ownerUid} ${homeId}`,
+              );
+            }
+          }
+
+          nextRuntime = buildRuntime({
+            status: cycleArmed ? "armed" : "countdown",
+            memberCount,
+            insideCount,
+            outsideCount,
+            unknownCount,
+            allOutsideSince,
+            cycleArmed,
+            now,
+          });
+        }
+
+        if (
+          runtimeSignature(runtime) !==
+          runtimeSignature(nextRuntime)
+        ) {
+          updates[runtimePath] = nextRuntime;
+        }
+      }
+    }
+
+    if (Object.keys(updates).length > 0) {
+      await db.ref().update(updates);
+    }
+
+    for (const line of logs) {
+      console.log(line);
+    }
+  } catch (error) {
+    console.log(
+      "AUTO AWAY MONITOR ERROR:",
+      error.message,
+    );
+  } finally {
+    autoAwayScanRunning = false;
+  }
+}
+
+function startAutoAwayMonitor({ db }) {
+  if (!db) {
+    throw new Error("AUTO AWAY DB IS REQUIRED");
+  }
+
+  if (autoAwayTimer) {
+    return;
+  }
+
+  console.log(
+    "📍 AUTO AWAY MONITOR STARTED:",
+    `delay=${AUTO_AWAY_ARM_DELAY_MS / 1000}s`,
+    `scan=${AUTO_AWAY_SCAN_INTERVAL_MS / 1000}s`,
+  );
+
+  void checkAutoAwayHomes(db);
+
+  autoAwayTimer = setInterval(
+    () => {
+      void checkAutoAwayHomes(db);
+    },
+    AUTO_AWAY_SCAN_INTERVAL_MS,
+  );
+}
+
+// ================= CHAT PUSH =================
+async function countUnreadChatMessages(
+  homeId,
+  receiverUid,
+) {
+  const [lastReadSnap, messagesSnap] =
+    await Promise.all([
+      db
+        .ref(`homeChats/${homeId}/lastRead/${receiverUid}`)
+        .once("value"),
+
+      db
+        .ref(`homeChats/${homeId}/messages`)
+        .once("value"),
+    ]);
+
+  const lastRead =
+    Number(lastReadSnap.val() || 0);
+
+  const messages =
+    messagesSnap.val() || {};
+
+  let unreadCount = 0;
+
+  for (const rawMessage of Object.values(messages)) {
+    const chatMessage = rawMessage || {};
+    const senderUid =
+      String(chatMessage.uid || "").trim();
+
+    const messageTime =
+      Number(chatMessage.time || 0);
+
+    if (
+      senderUid &&
+      senderUid !== receiverUid &&
+      Number.isFinite(messageTime) &&
+      messageTime > lastRead
+    ) {
+      unreadCount++;
+    }
+  }
+
+  return unreadCount;
+}
+
+async function sendChatNotificationPush({
+  receiverUid,
+  ownerUid,
+  homeId,
+  homeName,
+  senderUid,
+  senderName,
+  messageId,
+  text,
+  unreadCount,
+}) {
+  if (unreadCount <= 0) {
+    return;
+  }
+
+  const tokenSnap = await db
+    .ref(`accounts/${receiverUid}/fcmToken`)
+    .once("value");
+
+  const token =
+    String(tokenSnap.val() || "").trim();
+
+  if (!token) {
+    console.log(
+      "❌ NO TOKEN FOR CHAT:",
+      receiverUid,
+      homeId,
+    );
+
+    return;
+  }
+
+  const cleanHomeName =
+    String(homeName || "").trim() || "HomeChat";
+
+  const cleanSenderName =
+    String(senderName || "").trim() ||
+    "Một thành viên";
+
+  const cleanText =
+    String(text || "").trim();
+
+  const title =
+    unreadCount > 1
+      ? `${cleanHomeName} · ${unreadCount} tin nhắn mới`
+      : cleanHomeName;
+
+  const body =
+    `${cleanSenderName}: ${cleanText}`;
+
+  const data = {
+    type: "chat",
+    title,
+    body,
+    ownerUid: String(ownerUid || ""),
+    homeId: String(homeId || ""),
+    homeName: cleanHomeName,
+    senderUid: String(senderUid || ""),
+    senderName: cleanSenderName,
+    messageId: String(messageId || ""),
+    unreadCount: String(unreadCount),
+    clickAction: "home_chat",
+  };
+
+  await admin.messaging().send({
+    token,
+    data,
+
+    android: {
+      priority: "high",
+    },
+
+    apns: {
+      headers: {
+        "apns-priority": "10",
+      },
+      payload: {
+        aps: {
+          alert: {
+            title,
+            body,
+          },
+          sound: "default",
+          badge: unreadCount,
+          threadId: `home_chat_${homeId}`,
+        },
+      },
+    },
+  });
+
+  console.log(
+    "💬 CHAT PUSH SENT:",
+    receiverUid,
+    homeId,
+    unreadCount,
+  );
+}
+
 // ================= INIT =================
 async function init() {
   startDeviceMapListener();
@@ -1591,8 +2375,15 @@ async function init() {
   await db.ref("pair_requests").remove();
   console.log("🧹 OLD PAIR REQUESTS CLEARED");
 
+  await cleanupLegacySecurityScheduleState();
+
+  // Tự động chuyển Mode khi toàn bộ thành viên rời nhà.
+  startAutoAwayMonitor({ db });
+
   setInterval(cleanupExpiredAlarmPause, 60000);
   setInterval(checkScheduledNotifications, 60000);
+
+  // Kiểm tra lịch Alarm riêng của từng sensor.
   setInterval(checkScheduledAlarms, 60000);
 }
 const deviceDeleteInProgress = new Set();
@@ -1684,6 +2475,7 @@ db.ref("home_notification_requests").on("child_added", async (snap) => {
       "member",
       "alarm",
       "reminder",
+      "chat",
     ]);
 
     const allowedSeverities = new Set([
@@ -1741,6 +2533,9 @@ db.ref("home_notification_requests").on("child_added", async (snap) => {
     }
 
     const isTargeted = recipientUid.length > 0;
+    const isChatMessage =
+      !isTargeted &&
+      type === "chat";
 
     if (isTargeted && !targetedTypes.has(type)) {
       await rejectRequest("TARGET TYPE NOT ALLOWED");
@@ -1766,7 +2561,13 @@ db.ref("home_notification_requests").on("child_added", async (snap) => {
     const lastRequestTime =
       lastHomeNotificationRequestMap[rateKey] || 0;
 
-    if (now - lastRequestTime < 750) {
+    const rateLimitMillis =
+      isChatMessage ? 150 : 750;
+
+    if (
+      now - lastRequestTime <
+      rateLimitMillis
+    ) {
       await rejectRequest("RATE LIMITED");
       return;
     }
@@ -2016,6 +2817,118 @@ db.ref("home_notification_requests").on("child_added", async (snap) => {
       }
     }
 
+    let verifiedChatMessage = null;
+    let verifiedChatMessageId = "";
+
+    if (isChatMessage) {
+      const requestData =
+        req.data &&
+        typeof req.data === "object"
+          ? req.data
+          : {};
+
+      verifiedChatMessageId =
+        String(
+          requestData.messageId ||
+          entityId ||
+          "",
+        ).trim();
+
+      const invalidChatRequest =
+        category !== "chat" ||
+        severity !== "info" ||
+        deviceId.length > 0 ||
+        entityType !== "chat" ||
+        verifiedChatMessageId.length === 0 ||
+        verifiedChatMessageId.length > 160 ||
+        entityId !== verifiedChatMessageId ||
+        req.includeActor !== false ||
+        req.writeHomeTimeline !== false;
+
+      if (invalidChatRequest) {
+        await rejectRequest(
+          "INVALID CHAT REQUEST",
+        );
+        return;
+      }
+
+      const dedupeKey =
+        `${homeId}_${verifiedChatMessageId}`;
+
+      if (
+        processedChatNotificationMessages.has(
+          dedupeKey,
+        )
+      ) {
+        await snap.ref.remove();
+        return;
+      }
+
+      const chatMessageSnap = await db
+        .ref(
+          `homeChats/${homeId}/messages/${verifiedChatMessageId}`,
+        )
+        .once("value");
+
+      if (!chatMessageSnap.exists()) {
+        await rejectRequest(
+          "CHAT MESSAGE NOT FOUND",
+        );
+        return;
+      }
+
+      verifiedChatMessage =
+        chatMessageSnap.val() || {};
+
+      const chatSenderUid =
+        String(
+          verifiedChatMessage.uid || "",
+        ).trim();
+
+      const chatText =
+        String(
+          verifiedChatMessage.text || "",
+        ).trim();
+
+      const chatTime =
+        Number(verifiedChatMessage.time);
+
+      if (
+        chatSenderUid !== requestedBy ||
+        chatText.length === 0 ||
+        chatText.length > 1000 ||
+        !Number.isFinite(chatTime) ||
+        chatTime > now + 1000 ||
+        chatTime < now - 5 * 60 * 1000
+      ) {
+        await rejectRequest(
+          "INVALID CHAT MESSAGE",
+        );
+        return;
+      }
+
+      processedChatNotificationMessages.add(
+        dedupeKey,
+      );
+
+      if (
+        processedChatNotificationMessages.size >
+        2000
+      ) {
+        const oldestKey =
+          processedChatNotificationMessages
+            .values()
+            .next()
+            .value;
+
+        if (oldestKey) {
+          processedChatNotificationMessages.delete(
+            oldestKey,
+          );
+        }
+      }
+    }
+
     const isMemberLeave =
       !isTargeted &&
       role === "member" &&
@@ -2024,7 +2937,8 @@ db.ref("home_notification_requests").on("child_added", async (snap) => {
     if (
       !isTargeted &&
       role === "member" &&
-      !isMemberLeave
+      !isMemberLeave &&
+      !isChatMessage
     ) {
       await rejectRequest("MEMBER TYPE NOT ALLOWED");
       return;
@@ -2077,7 +2991,8 @@ db.ref("home_notification_requests").on("child_added", async (snap) => {
       entityType.length > 0 &&
       entityType !== "home" &&
       entityType !== "device" &&
-      entityType !== "member"
+      entityType !== "member" &&
+      entityType !== "chat"
     ) {
       await rejectRequest("INVALID ENTITY TYPE");
       return;
@@ -2172,6 +3087,26 @@ db.ref("home_notification_requests").on("child_added", async (snap) => {
       finalEntityId = homeId;
     }
 
+    if (
+      isChatMessage &&
+      verifiedChatMessage
+    ) {
+      const verifiedText =
+        String(
+          verifiedChatMessage.text || "",
+        ).trim();
+
+      finalType = "chat";
+      finalCategory = "chat";
+      finalSeverity = "info";
+      finalTitle = homeName;
+      finalMessage =
+        `${actorName}: ${verifiedText}`;
+      finalEntityType = "chat";
+      finalEntityId =
+        verifiedChatMessageId;
+    }
+
     const recipientUids = new Set();
 
     if (isTargeted) {
@@ -2210,6 +3145,35 @@ db.ref("home_notification_requests").on("child_added", async (snap) => {
     }
 
     for (const targetUid of recipientUids) {
+      if (
+        isChatMessage &&
+        verifiedChatMessage
+      ) {
+        const unreadCount =
+          await countUnreadChatMessages(
+            homeId,
+            targetUid,
+          );
+
+        await sendChatNotificationPush({
+          receiverUid: targetUid,
+          ownerUid,
+          homeId,
+          homeName,
+          senderUid: requestedBy,
+          senderName: actorName,
+          messageId:
+            verifiedChatMessageId,
+          text:
+            String(
+              verifiedChatMessage.text || "",
+            ).trim(),
+          unreadCount,
+        });
+
+        continue;
+      }
+
       await addHomeNotificationFromBackend({
         uid: targetUid,
         homeId,
@@ -2226,6 +3190,7 @@ db.ref("home_notification_requests").on("child_added", async (snap) => {
 
     if (
       !isTargeted &&
+      !isChatMessage &&
       req.writeHomeTimeline === true
     ) {
       const eventsRef = db.ref(
@@ -3617,6 +4582,7 @@ client.on("message", async (topic, msg) => {
     // ===== NEW MULTI ALARM FORMAT =====
     await processScheduleAlarmsForOwner(
       uid,
+      uid,
       homeId,
       homeName,
       deviceId,
@@ -3644,6 +4610,7 @@ client.on("message", async (topic, msg) => {
 
       await processScheduleAlarmsForOwner(
         sharedUid,
+        uid,
         homeId,
         homeName,
         deviceId,
