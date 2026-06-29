@@ -14,6 +14,36 @@ const pendingScheduleReminderMap = {};
 const pendingScheduleReminderTimerMap = {};
 const userDirectoryCache = {};
 const processedChatNotificationMessages = new Set();
+
+// ================= ALARM ESCALATION =================
+// Sự cố an ninh thông thường:
+// Phát hiện → Alarm sau 15 giây → Còi lớn sau 30 giây
+// → chuẩn bị gọi điện sau 60 giây.
+const ALARM_INCIDENT_ALARM_DELAY_MS = 15 * 1000;
+const ALARM_INCIDENT_SIREN_DELAY_MS = 30 * 1000;
+const ALARM_INCIDENT_CALL_DELAY_MS = 60 * 1000;
+
+// Sự cố khẩn cấp: SOS, khói/cháy, gas, ngập nước.
+// Notification ưu tiên ngay → Fullscreen + điểm nối còi trong nhà sau 5 giây
+// → chuẩn bị gọi điện sau tổng cộng 35 giây.
+const EMERGENCY_FULLSCREEN_DELAY_MS = 5 * 1000;
+const EMERGENCY_CALL_DELAY_MS = 35 * 1000;
+// Chỉ gộp các packet liên tiếp của cùng một lần kích hoạt.
+// Sau khoảng này, lần mở cửa / SOS mới phải tạo incident mới
+// để notification và các cấp sau chạy lại từ đầu.
+const SECURITY_MERGE_WINDOW_MS = 10 * 1000;
+const EMERGENCY_MERGE_WINDOW_MS = 10 * 1000;
+
+const ALARM_INCIDENT_AUTO_EXPIRE_MS = 30 * 60 * 1000;
+
+// Hub ghi heartbeat lên Firebase mỗi 30 giây.
+// App sẽ coi hub Offline khi lastHeartbeatAt quá 90 giây.
+const HUB_HEARTBEAT_INTERVAL_MS = 30 * 1000;
+const HUB_HEARTBEAT_STARTED_AT = Date.now();
+
+const alarmIncidentTimerMap = {};
+const alarmIncidentAdvanceInProgress = new Set();
+const alarmIncidentActionInProgress = new Set();
 function getPiSerial() {
   try {
     const cpuInfo = fs.readFileSync("/proc/cpuinfo", "utf8");
@@ -48,6 +78,134 @@ admin.initializeApp({
 });
 
 const db = admin.database();
+
+let hubHeartbeatTimer = null;
+let hubHeartbeatWriteInProgress = false;
+let hubHeartbeatWriteCount = 0;
+let mqttConnected = false;
+
+async function getHomesLinkedToThisHub() {
+  const snap = await db
+    .ref("system/devices_by_ieee")
+    .once("value");
+
+  const index = snap.val() || {};
+  const homes = new Map();
+
+  for (const value of Object.values(index)) {
+    const item = value || {};
+    const itemHubId = String(
+      item.deviceId || "",
+    ).trim();
+
+    if (itemHubId !== DEVICE_ID) {
+      continue;
+    }
+
+    const uid = String(item.uid || "").trim();
+    const homeId = String(item.homeId || "").trim();
+
+    if (!uid || !homeId) {
+      continue;
+    }
+
+    homes.set(
+      `${uid}|${homeId}`,
+      {
+        uid,
+        homeId,
+      },
+    );
+  }
+
+  return [...homes.values()];
+}
+
+async function writeHubHeartbeat() {
+  if (hubHeartbeatWriteInProgress) {
+    return;
+  }
+
+  hubHeartbeatWriteInProgress = true;
+
+  try {
+    const linkedHomes =
+      await getHomesLinkedToThisHub();
+
+    const now = Date.now();
+
+    const heartbeat = {
+      hubId: DEVICE_ID,
+      hubType: "raspberry_pi",
+      status: "online",
+      mqttConnected,
+      backendPid: process.pid,
+      startedAt: HUB_HEARTBEAT_STARTED_AT,
+      lastHeartbeatAt: now,
+      heartbeatIntervalMs:
+        HUB_HEARTBEAT_INTERVAL_MS,
+    };
+
+    const updates = {
+      [`system/hubs/${DEVICE_ID}`]: heartbeat,
+    };
+
+    for (const item of linkedHomes) {
+      const basePath =
+        `accounts/${item.uid}/homes/${item.homeId}`;
+
+      // Lưu liên kết Hub trực tiếp trong nhà để app không phải
+      // đọc toàn bộ system/devices_by_ieee.
+      updates[`${basePath}/hubId`] = DEVICE_ID;
+      updates[`${basePath}/hubStatus`] = heartbeat;
+    }
+
+    await db.ref().update(updates);
+
+    hubHeartbeatWriteCount++;
+
+    // Chỉ ghi log lần đầu và mỗi 10 phút để tránh làm đầy journal.
+    if (
+      hubHeartbeatWriteCount === 1 ||
+      hubHeartbeatWriteCount % 20 === 0
+    ) {
+      console.log(
+        "💓 HUB HEARTBEAT:",
+        DEVICE_ID,
+        `homes=${linkedHomes.length}`,
+        `mqtt=${mqttConnected}`,
+      );
+    }
+  } catch (err) {
+    console.log(
+      "HUB HEARTBEAT ERROR:",
+      err.message,
+    );
+  } finally {
+    hubHeartbeatWriteInProgress = false;
+  }
+}
+
+function startHubHeartbeat() {
+  if (hubHeartbeatTimer) {
+    return;
+  }
+
+  void writeHubHeartbeat();
+
+  hubHeartbeatTimer = setInterval(
+    () => {
+      void writeHubHeartbeat();
+    },
+    HUB_HEARTBEAT_INTERVAL_MS,
+  );
+
+  console.log(
+    "💓 HUB HEARTBEAT STARTED:",
+    DEVICE_ID,
+    `interval=${HUB_HEARTBEAT_INTERVAL_MS / 1000}s`,
+  );
+}
 
 // ================= MQTT =================
 const client = mqtt.connect("mqtt://localhost:1883");
@@ -328,6 +486,197 @@ function setPermitJoin(enable, time = 60) {
 }
 
 // ================= PUSH =================
+
+function normalizeFcmToken(raw) {
+  return String(raw || "").trim();
+}
+
+async function getUserFcmTargets(uid) {
+  const accountSnap = await db
+    .ref(`accounts/${uid}`)
+    .once("value");
+
+  const account = accountSnap.val() || {};
+  const targetsByToken = new Map();
+
+  function addTarget(tokenValue, path) {
+    const token = normalizeFcmToken(tokenValue);
+
+    if (!token || !path) {
+      return;
+    }
+
+    if (!targetsByToken.has(token)) {
+      targetsByToken.set(token, {
+        token,
+        paths: new Set(),
+      });
+    }
+
+    targetsByToken.get(token).paths.add(path);
+  }
+
+  addTarget(
+    account.fcmToken,
+    `accounts/${uid}/fcmToken`,
+  );
+
+  const installations =
+    account.fcmTokens &&
+    typeof account.fcmTokens === "object"
+      ? account.fcmTokens
+      : {};
+
+  for (const [installationId, rawEntry] of Object.entries(
+    installations,
+  )) {
+    const entryPath =
+      `accounts/${uid}/fcmTokens/${installationId}`;
+
+    if (typeof rawEntry === "string") {
+      addTarget(rawEntry, entryPath);
+      continue;
+    }
+
+    if (rawEntry && typeof rawEntry === "object") {
+      addTarget(rawEntry.token, entryPath);
+    }
+  }
+
+  return Array.from(targetsByToken.values()).map(
+    (target) => ({
+      token: target.token,
+      paths: Array.from(target.paths),
+    }),
+  );
+}
+
+function isInvalidFcmTokenError(error) {
+  const code = String(
+    error?.errorInfo?.code ||
+    error?.code ||
+    "",
+  );
+
+  return (
+    code ===
+      "messaging/registration-token-not-registered" ||
+    code ===
+      "messaging/invalid-registration-token"
+  );
+}
+
+async function removeInvalidFcmTokenPaths(paths) {
+  const updates = {};
+
+  for (const path of paths) {
+    if (path) {
+      updates[path] = null;
+    }
+  }
+
+  if (Object.keys(updates).length === 0) {
+    return;
+  }
+
+  await db.ref().update(updates);
+}
+
+async function sendPushToUser(
+  uid,
+  message,
+  logLabel = "PUSH",
+) {
+  const targets = await getUserFcmTargets(uid);
+
+  if (targets.length === 0) {
+    console.log(
+      "❌ NO FCM TOKEN:",
+      uid,
+      logLabel,
+    );
+
+    return {
+      total: 0,
+      sent: 0,
+      failed: 0,
+      removed: 0,
+    };
+  }
+
+  let sent = 0;
+  let failed = 0;
+  const invalidPaths = new Set();
+
+  for (const target of targets) {
+    try {
+      await admin.messaging().send({
+        ...message,
+        token: target.token,
+      });
+
+      sent++;
+    } catch (error) {
+      failed++;
+
+      if (isInvalidFcmTokenError(error)) {
+        for (const path of target.paths) {
+          invalidPaths.add(path);
+        }
+
+        console.log(
+          "🧹 INVALID FCM TOKEN:",
+          uid,
+          logLabel,
+          error?.errorInfo?.code ||
+            error?.code ||
+            error.message,
+        );
+
+        continue;
+      }
+
+      console.log(
+        "FCM TARGET SEND ERROR:",
+        uid,
+        logLabel,
+        error.message,
+      );
+    }
+  }
+
+  if (invalidPaths.size > 0) {
+    try {
+      await removeInvalidFcmTokenPaths(
+        Array.from(invalidPaths),
+      );
+    } catch (error) {
+      console.log(
+        "FCM TOKEN CLEANUP ERROR:",
+        uid,
+        logLabel,
+        error.message,
+      );
+    }
+  }
+
+  console.log(
+    "📨 MULTI-DEVICE PUSH:",
+    uid,
+    logLabel,
+    `sent=${sent}`,
+    `failed=${failed}`,
+    `targets=${targets.length}`,
+  );
+
+  return {
+    total: targets.length,
+    sent,
+    failed,
+    removed: invalidPaths.size,
+  };
+}
+
 async function sendScheduledReminderSummary(uid, items) {
   try {
     if (!items || items.length === 0) return;
@@ -407,47 +756,40 @@ async function sendScheduledReminderSummary(uid, items) {
       })
       .join("\n");
 
-    const tokenSnap = await db
-      .ref(`accounts/${uid}/fcmToken`)
-      .once("value");
+    const pushResult = await sendPushToUser(
+      uid,
+      {
+        data: {
+          type: "schedule_notification",
+          title,
+          body,
+          homeId:
+            uniqueItems.length === 1
+              ? uniqueItems[0].homeId || ""
+              : "",
+          uid: uid || "",
+          isSafe: allSafe ? "true" : "false",
+          reason,
+          reminderItems: JSON.stringify(reminderItems),
+          clickAction: "schedule_SCREEN",
+        },
 
-    const token = tokenSnap.val();
+        android: {
+          priority: "high",
+        },
+      },
+      "SCHEDULE SUMMARY",
+    );
 
-    if (!token) {
-      console.log(
-        "❌ NO TOKEN FOR SCHEDULE:",
-        uid,
-      );
+    if (pushResult.sent === 0) {
       return;
     }
-
-    await admin.messaging().send({
-      token,
-
-      data: {
-        type: "schedule_notification",
-        title,
-        body,
-        homeId:
-          uniqueItems.length === 1
-            ? uniqueItems[0].homeId || ""
-            : "",
-        uid: uid || "",
-        isSafe: allSafe ? "true" : "false",
-        reason,
-        reminderItems: JSON.stringify(reminderItems),
-        clickAction: "schedule_SCREEN",
-      },
-
-      android: {
-        priority: "high",
-      },
-    });
 
     console.log(
       "🔔 SCHEDULE SUMMARY SENT:",
       uid,
       uniqueItems.length,
+      `devices=${pushResult.sent}`,
     );
   } catch (err) {
     console.log(
@@ -668,48 +1010,51 @@ async function sendAlarm(uid, homeId, reason) {
       console.log("🔕 ALARM MUTED BY USER:", uid, homeId);
       return;
     }
-    const snap = await db.ref(`accounts/${uid}/fcmToken`).once("value");
-    const token = snap.val();
-
-    if (!token) {
-      console.log("❌ NO TOKEN");
-      return;
-    }
-
-    await admin.messaging().send({
-      token,
-
-      data: {
-        type: "alarm",
-        title: "🚨 SAFEHOME",
-        body: reason || "Có cảnh báo!",
-        homeId: homeId || "",
-        uid: uid || "",
-        clickAction: "alarm_SCREEN",
-      },
-
-      android: {
-        priority: "high",
-      },
-
-      apns: {
-        headers: {
-          "apns-priority": "10",
+    const pushResult = await sendPushToUser(
+      uid,
+      {
+        data: {
+          type: "alarm",
+          title: "🚨 SAFEHOME",
+          body: reason || "Có cảnh báo!",
+          homeId: homeId || "",
+          uid: uid || "",
+          clickAction: "alarm_SCREEN",
         },
-        payload: {
-          aps: {
-            alert: {
-              title: "🚨 SAFEHOME",
-              body: reason || "Có cảnh báo!",
+
+        android: {
+          priority: "high",
+        },
+
+        apns: {
+          headers: {
+            "apns-priority": "10",
+          },
+          payload: {
+            aps: {
+              alert: {
+                title: "🚨 SAFEHOME",
+                body: reason || "Có cảnh báo!",
+              },
+              sound: "default",
+              badge: 1,
             },
-            sound: "default",
-            badge: 1,
           },
         },
       },
-    });
+      "ALARM",
+    );
 
-    console.log("🚨 PUSH SENT:", uid, homeId);
+    if (pushResult.sent === 0) {
+      return;
+    }
+
+    console.log(
+      "🚨 PUSH SENT:",
+      uid,
+      homeId,
+      `devices=${pushResult.sent}`,
+    );
   } catch (err) {
     console.log("FCM ERROR:", err.message);
   }
@@ -721,43 +1066,40 @@ async function sendAlarmPauseNotification(
   text,
 ) {
   try {
-    const snap = await db
-      .ref(`accounts/${uid}/fcmToken`)
-      .once("value");
+    const pushResult = await sendPushToUser(
+      uid,
+      {
+        data: {
+          type: "schedule_notification",
+          forceShow: "true",
+          reason: text,
+          severity: "warning",
+          isSafe: "false",
+          title: homeName || "Nhà",
+          body: text,
+          homeId: homeId || "",
+          uid: uid || "",
+          clickAction: "schedule_SCREEN",
+        },
 
-    const token = snap.val();
+        // Data-only để app dùng đúng một notification Reminder
+        // ID 999998 và channel ưu tiên mới.
+        android: {
+          priority: "high",
+        },
+      },
+      "ALARM PAUSE",
+    );
 
-    if (!token) {
+    if (pushResult.sent === 0) {
       return;
     }
-
-    await admin.messaging().send({
-      token,
-
-      data: {
-        type: "schedule_notification",
-        forceShow: "true",
-        reason: text,
-        severity: "warning",
-        isSafe: "false",
-        title: homeName || "Nhà",
-        body: text,
-        homeId: homeId || "",
-        uid: uid || "",
-        clickAction: "schedule_SCREEN",
-      },
-
-      // Data-only để app dùng đúng một notification Reminder
-      // ID 999998 và channel ưu tiên mới.
-      android: {
-        priority: "high",
-      },
-    });
 
     console.log(
       "⏸️ ALARM PAUSE WARNING SENT:",
       uid,
       homeId,
+      `devices=${pushResult.sent}`,
     );
   } catch (err) {
     console.log(
@@ -849,23 +1191,164 @@ async function addHomeNotificationFromBackend({
     );
   }
 }
-async function sendAlarmSummary(uid, items) {
-  try {
-    if (!items || items.length === 0) return;
+function getAlarmIncidentTargetKey(
+  receiverUid,
+  ownerUid,
+  homeId,
+  flowType = "security",
+) {
+  return crypto
+    .createHash("sha256")
+    .update(
+      [
+        String(receiverUid || ""),
+        String(ownerUid || ""),
+        String(homeId || ""),
+        String(flowType || "security"),
+      ].join("|"),
+    )
+    .digest("hex")
+    .slice(0, 24);
+}
 
-    const uniqueItems = [];
+function getAlarmIncidentTimerKey(uid, incidentId) {
+  return `${uid}_${incidentId}`;
+}
 
-    for (const item of items) {
-      const exists = uniqueItems.some((oldItem) => {
-        return oldItem.homeId === item.homeId && oldItem.reason === item.reason;
-      });
+function clearAlarmIncidentTimers(uid, incidentId) {
+  const key = getAlarmIncidentTimerKey(uid, incidentId);
+  const timers = alarmIncidentTimerMap[key] || {};
 
-      if (!exists) uniqueItems.push(item);
+  for (const timer of Object.values(timers)) {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+
+  delete alarmIncidentTimerMap[key];
+}
+
+function normalizeAlarmIncidentItems(items) {
+  const uniqueItems = [];
+
+  for (const rawItem of Array.isArray(items) ? items : []) {
+    const item = rawItem || {};
+    const homeId = String(item.homeId || "").trim();
+    const reason = String(item.reason || "").trim();
+
+    if (!homeId || !reason) {
+      continue;
     }
 
+    const exists = uniqueItems.some((oldItem) => {
+      return (
+        oldItem.homeId === homeId &&
+        oldItem.reason === reason
+      );
+    });
+
+    if (!exists) {
+      uniqueItems.push({
+        ownerUid: String(item.ownerUid || "").trim(),
+        homeId,
+        homeName:
+          String(item.homeName || "").trim() || homeId,
+        deviceName: String(item.deviceName || "").trim(),
+        type: String(item.type || "").trim(),
+        reason,
+        repeatMinutes: normalizeRepeatMinutes(
+          item.repeatMinutes,
+        ),
+        nextAlarm: String(item.nextAlarm || "").trim(),
+      });
+    }
+  }
+
+  return uniqueItems.slice(0, 20);
+}
+
+function getAlarmIncidentFlowType(items) {
+  const normalized = normalizeAlarmIncidentItems(items);
+
+  return normalized.some((item) => {
+    return isEmergencyDeviceType(
+      String(item.type || "").trim(),
+    );
+  })
+    ? "emergency"
+    : "security";
+}
+
+function getEmergencyIncidentTitle(items) {
+  const types = new Set(
+    normalizeAlarmIncidentItems(items).map((item) => {
+      return String(item.type || "").trim();
+    }),
+  );
+
+  if (types.has("sos")) {
+    return "🆘 SOS KHẨN CẤP";
+  }
+
+  if (types.has("smoke")) {
+    return "🔥 CẢNH BÁO KHÓI / CHÁY";
+  }
+
+  if (types.has("gas")) {
+    return "⚠️ CẢNH BÁO RÒ RỈ GAS";
+  }
+
+  if (
+    types.has("water_leak") ||
+    types.has("flood")
+  ) {
+    return "🌊 CẢNH BÁO NGẬP NƯỚC";
+  }
+
+  return "🚨 CẢNH BÁO KHẨN CẤP";
+}
+
+
+function getAlarmIncidentLines(items) {
+  const normalized = normalizeAlarmIncidentItems(items);
+  const lines = normalized.slice(0, 4).map((item) => {
+    return `${item.homeName}: ${item.reason}`;
+  });
+
+  if (normalized.length > 4) {
+    lines.push("...");
+  }
+
+  return lines;
+}
+
+async function sendAlarmStageSummary(
+  uid,
+  items,
+  {
+    incidentId = "",
+    stage = "alarm",
+    flowType = "security",
+  } = {},
+) {
+  try {
+    const uniqueItems = normalizeAlarmIncidentItems(items);
+
+    if (uniqueItems.length === 0) {
+      return false;
+    }
+
+    const isEmergency = flowType === "emergency";
     const allowedItems = [];
 
     for (const item of uniqueItems) {
+      // Emergency không bị chặn bởi lịch, Mode,
+      // tạm dừng Alarm hoặc cài đặt nhận Alarm.
+      if (isEmergency) {
+        allowedItems.push(item);
+        continue;
+      }
+
       const enabled = await canReceiveAlarm(
         uid,
         item.homeId,
@@ -878,43 +1361,73 @@ async function sendAlarmSummary(uid, items) {
     }
 
     if (allowedItems.length === 0) {
-      console.log("🔕 ALARM SUMMARY MUTED ALL:", uid);
-      return;
+      console.log(
+        "🔕 ALARM INCIDENT MUTED:",
+        uid,
+        incidentId,
+        stage,
+      );
+      return false;
     }
 
-    const snap = await db.ref(`accounts/${uid}/fcmToken`).once("value");
-    const token = snap.val();
+    const lines = getAlarmIncidentLines(allowedItems);
+    const body = lines.join("\n");
 
-    if (!token) {
-      console.log("❌ NO TOKEN FOR ALARM SUMMARY:", uid);
-      return;
+    let type = "alarm";
+    let title = "🚨 SAFEHOME";
+    let clickAction = "alarm_SCREEN";
+    let apnsSound = "default";
+
+    if (
+      isEmergency &&
+      stage === "notification"
+    ) {
+      type = "emergency_notification";
+      title = getEmergencyIncidentTitle(allowedItems);
+      clickAction = "emergency_NOTIFICATION";
+      apnsSound = "default";
+    } else if (
+      isEmergency &&
+      stage === "fullscreen_siren"
+    ) {
+      type = "alarm_siren";
+      title = getEmergencyIncidentTitle(allowedItems);
+      clickAction = "alarm_SIREN_SCREEN";
+      apnsSound = "default";
+    } else if (stage === "detected") {
+      type = "alarm_detected";
+      title = "SafeHome phát hiện bất thường";
+      clickAction = "alarm_detected";
+      apnsSound = null;
+    } else if (stage === "siren") {
+      type = "alarm_siren";
+      title = "🚨 CẢNH BÁO KHẨN CẤP";
+      clickAction = "alarm_SIREN_SCREEN";
+      apnsSound = "default";
     }
 
-    const lines = allowedItems.slice(0, 4).map((item) => {
-      return `${item.homeName}: ${item.reason}`;
-    });
-
-    if (allowedItems.length > 4) {
-      lines.push("...");
-    }
-
-    console.log("🚨 ALARM ITEMS:", JSON.stringify(allowedItems, null, 2));
-
-    await admin.messaging().send({
-      token,
-
+    const message = {
       data: {
-        type: "alarm",
-        title: "🚨 SAFEHOME",
-        body: lines.join("\n"),
+        type,
+        title,
+        body,
         alarmItems: JSON.stringify(allowedItems),
-        clickAction: "alarm_SCREEN",
+        incidentId: String(incidentId || ""),
+        alarmStage: stage,
+        alarmFlowType: flowType,
+        homeId:
+          allowedItems.length === 1
+            ? allowedItems[0].homeId
+            : "",
+        ownerUid:
+          allowedItems.length === 1
+            ? allowedItems[0].ownerUid || ""
+            : "",
+        clickAction,
       },
-
       android: {
         priority: "high",
       },
-
       apns: {
         headers: {
           "apns-priority": "10",
@@ -922,28 +1435,922 @@ async function sendAlarmSummary(uid, items) {
         payload: {
           aps: {
             alert: {
-              title: "🚨 SAFEHOME",
-              body: lines.join("\n"),
+              title,
+              body,
             },
-            sound: "default",
             badge: 1,
           },
         },
       },
-    });
+    };
 
-    console.log("🚨 SUMMARY PUSH SENT:", uid, allowedItems.length);
+    if (apnsSound) {
+      message.apns.payload.aps.sound = apnsSound;
+    }
+
+    const pushResult = await sendPushToUser(
+      uid,
+      message,
+      `ALARM INCIDENT ${flowType}/${stage}`,
+    );
+
+    if (pushResult.sent === 0) {
+      return false;
+    }
+
+    console.log(
+      "🚨 ALARM INCIDENT PUSH:",
+      uid,
+      incidentId,
+      flowType,
+      stage,
+      allowedItems.length,
+      `devices=${pushResult.sent}`,
+    );
+
+    return true;
   } catch (err) {
-    console.log("SUMMARY ALARM ERROR:", err.message);
+    console.log(
+      "ALARM INCIDENT PUSH ERROR:",
+      uid,
+      incidentId,
+      flowType,
+      stage,
+      err.message,
+    );
+    return false;
   }
 }
+
+async function sendAlarmResolvedPush({
+  uid,
+  incidentId,
+  homeId,
+  resolvedBy,
+  action,
+}) {
+  try {
+    await sendPushToUser(
+      uid,
+      {
+        data: {
+          type: "alarm_resolved",
+          incidentId: String(incidentId || ""),
+          homeId: String(homeId || ""),
+          resolvedBy: String(resolvedBy || ""),
+          action: String(action || "resolved"),
+          clickAction: "alarm_RESOLVED",
+        },
+        android: {
+          priority: "high",
+        },
+      },
+      "ALARM RESOLVED",
+    );
+  } catch (err) {
+    console.log(
+      "ALARM RESOLVED PUSH ERROR:",
+      uid,
+      incidentId,
+      err.message,
+    );
+  }
+}
+
+async function getActiveAlarmIncident(
+  receiverUid,
+  targetKey,
+) {
+  const indexRef = db.ref(
+    `accounts/${receiverUid}/activeAlarmIncidentByTarget/${targetKey}`,
+  );
+
+  const incidentIdSnap = await indexRef.once("value");
+  const incidentId = String(
+    incidentIdSnap.val() || "",
+  ).trim();
+
+  if (!incidentId) {
+    return null;
+  }
+
+  const incidentRef = db.ref(
+    `accounts/${receiverUid}/alarmIncidents/${incidentId}`,
+  );
+
+  const incidentSnap = await incidentRef.once("value");
+  const incident = incidentSnap.val();
+
+  if (!incident || incident.status !== "active") {
+    await indexRef.remove();
+    return null;
+  }
+
+  return {
+    incidentId,
+    incident,
+  };
+}
+
+async function advanceAlarmIncidentToStage(
+  receiverUid,
+  incidentId,
+  targetStage,
+) {
+  const lockKey = `${receiverUid}_${incidentId}`;
+
+  if (alarmIncidentAdvanceInProgress.has(lockKey)) {
+    return;
+  }
+
+  alarmIncidentAdvanceInProgress.add(lockKey);
+
+  try {
+    const incidentRef = db.ref(
+      `accounts/${receiverUid}/alarmIncidents/${incidentId}`,
+    );
+
+    let incidentSnap = await incidentRef.once("value");
+    let incident = incidentSnap.val();
+
+    if (!incident || incident.status !== "active") {
+      return;
+    }
+
+    const flowType =
+      incident.flowType === "emergency"
+        ? "emergency"
+        : "security";
+
+    const order = flowType === "emergency"
+      ? [
+          "notification",
+          "fullscreen_siren",
+          "calling",
+        ]
+      : [
+          "detected",
+          "alarm",
+          "siren",
+          "calling",
+        ];
+
+    const targetRank = order.indexOf(targetStage);
+
+    if (targetRank < 1) {
+      return;
+    }
+
+    let currentRank = order.indexOf(
+      String(
+        incident.stage ||
+        (flowType === "emergency"
+          ? "notification"
+          : "detected"),
+      ),
+    );
+
+    if (currentRank < 0) {
+      currentRank = 0;
+    }
+
+    for (
+      let nextRank = currentRank + 1;
+      nextRank <= targetRank;
+      nextRank++
+    ) {
+      incidentSnap = await incidentRef.once("value");
+      incident = incidentSnap.val();
+
+      if (!incident || incident.status !== "active") {
+        return;
+      }
+
+      const nextStage = order[nextRank];
+      const items = normalizeAlarmIncidentItems(
+        incident.items,
+      );
+      const now = Date.now();
+
+      if (nextStage === "alarm") {
+        await sendAlarmStageSummary(
+          receiverUid,
+          items,
+          {
+            incidentId,
+            stage: "alarm",
+            flowType,
+          },
+        );
+
+        await incidentRef.update({
+          stage: "alarm",
+          alarmSentAt: now,
+          updatedAt: now,
+        });
+      } else if (nextStage === "siren") {
+        await sendAlarmStageSummary(
+          receiverUid,
+          items,
+          {
+            incidentId,
+            stage: "siren",
+            flowType,
+          },
+        );
+
+        await incidentRef.update({
+          stage: "siren",
+          sirenSentAt: now,
+          updatedAt: now,
+        });
+      } else if (
+        nextStage === "fullscreen_siren"
+      ) {
+        await sendAlarmStageSummary(
+          receiverUid,
+          items,
+          {
+            incidentId,
+            stage: "fullscreen_siren",
+            flowType,
+          },
+        );
+
+        await incidentRef.update({
+          stage: "fullscreen_siren",
+          fullscreenSentAt: now,
+          // Điểm nối cho còi vật lý trong nhà.
+          homeSirenStatus: "waiting_devices",
+          homeSirenRequestedAt: now,
+          updatedAt: now,
+        });
+
+        console.log(
+          "📢 HOME SIREN STAGE READY:",
+          receiverUid,
+          incidentId,
+          incident.homeId,
+        );
+      } else if (nextStage === "calling") {
+        // Chưa gọi thật cho tới khi kết nối Cloud Telephony.
+        await incidentRef.update({
+          stage: "calling",
+          callStatus: "waiting_provider",
+          callRequestedAt: now,
+          updatedAt: now,
+        });
+
+        console.log(
+          "📞 ALARM CALL STAGE READY:",
+          receiverUid,
+          incidentId,
+          incident.homeId,
+        );
+      }
+    }
+  } catch (err) {
+    console.log(
+      "ALARM INCIDENT ADVANCE ERROR:",
+      receiverUid,
+      incidentId,
+      targetStage,
+      err.message,
+    );
+  } finally {
+    alarmIncidentAdvanceInProgress.delete(lockKey);
+  }
+}
+
+async function expireAlarmIncident(
+  receiverUid,
+  incidentId,
+) {
+  try {
+    const incidentRef = db.ref(
+      `accounts/${receiverUid}/alarmIncidents/${incidentId}`,
+    );
+
+    const snap = await incidentRef.once("value");
+    const incident = snap.val();
+
+    if (!incident || incident.status !== "active") {
+      clearAlarmIncidentTimers(receiverUid, incidentId);
+      return;
+    }
+
+    const targetKey = String(
+      incident.targetKey || "",
+    ).trim();
+
+    const updates = {
+      [`accounts/${receiverUid}/alarmIncidents/${incidentId}/status`]:
+        "expired",
+      [`accounts/${receiverUid}/alarmIncidents/${incidentId}/stage`]:
+        "expired",
+      [`accounts/${receiverUid}/alarmIncidents/${incidentId}/expiredAt`]:
+        Date.now(),
+      [`accounts/${receiverUid}/alarmIncidents/${incidentId}/updatedAt`]:
+        Date.now(),
+      [`accounts/${receiverUid}/alarmIncidents/${incidentId}/homeSirenStatus`]:
+        "stop_requested",
+    };
+
+    if (targetKey) {
+      updates[
+        `accounts/${receiverUid}/activeAlarmIncidentByTarget/${targetKey}`
+      ] = null;
+    }
+
+    await db.ref().update(updates);
+    clearAlarmIncidentTimers(receiverUid, incidentId);
+
+    console.log(
+      "⌛ ALARM INCIDENT EXPIRED:",
+      receiverUid,
+      incidentId,
+    );
+  } catch (err) {
+    console.log(
+      "ALARM INCIDENT EXPIRE ERROR:",
+      receiverUid,
+      incidentId,
+      err.message,
+    );
+  }
+}
+
+function scheduleAlarmIncidentStages(
+  receiverUid,
+  incidentId,
+  incident,
+) {
+  clearAlarmIncidentTimers(receiverUid, incidentId);
+
+  if (!incident || incident.status !== "active") {
+    return;
+  }
+
+  const key = getAlarmIncidentTimerKey(
+    receiverUid,
+    incidentId,
+  );
+
+  const now = Date.now();
+  const detectedAt = Number(
+    incident.detectedAt || incident.createdAt || now,
+  );
+
+  const expireAt = Number(
+    incident.expireAt ||
+      detectedAt + ALARM_INCIDENT_AUTO_EXPIRE_MS,
+  );
+
+  const flowType =
+    incident.flowType === "emergency"
+      ? "emergency"
+      : "security";
+
+  if (flowType === "emergency") {
+    const fullscreenDueAt = Number(
+      incident.fullscreenDueAt ||
+        detectedAt + EMERGENCY_FULLSCREEN_DELAY_MS,
+    );
+
+    const callDueAt = Number(
+      incident.callDueAt ||
+        detectedAt + EMERGENCY_CALL_DELAY_MS,
+    );
+
+    alarmIncidentTimerMap[key] = {
+      fullscreenSiren: setTimeout(
+        () => {
+          void advanceAlarmIncidentToStage(
+            receiverUid,
+            incidentId,
+            "fullscreen_siren",
+          );
+        },
+        Math.max(0, fullscreenDueAt - now),
+      ),
+      calling: setTimeout(
+        () => {
+          void advanceAlarmIncidentToStage(
+            receiverUid,
+            incidentId,
+            "calling",
+          );
+        },
+        Math.max(0, callDueAt - now),
+      ),
+      expire: setTimeout(
+        () => {
+          void expireAlarmIncident(
+            receiverUid,
+            incidentId,
+          );
+        },
+        Math.max(0, expireAt - now),
+      ),
+    };
+
+    return;
+  }
+
+  const alarmDueAt = Number(
+    incident.alarmDueAt ||
+      detectedAt + ALARM_INCIDENT_ALARM_DELAY_MS,
+  );
+
+  const sirenDueAt = Number(
+    incident.sirenDueAt ||
+      detectedAt + ALARM_INCIDENT_SIREN_DELAY_MS,
+  );
+
+  const callDueAt = Number(
+    incident.callDueAt ||
+      detectedAt + ALARM_INCIDENT_CALL_DELAY_MS,
+  );
+
+  alarmIncidentTimerMap[key] = {
+    alarm: setTimeout(
+      () => {
+        void advanceAlarmIncidentToStage(
+          receiverUid,
+          incidentId,
+          "alarm",
+        );
+      },
+      Math.max(0, alarmDueAt - now),
+    ),
+    siren: setTimeout(
+      () => {
+        void advanceAlarmIncidentToStage(
+          receiverUid,
+          incidentId,
+          "siren",
+        );
+      },
+      Math.max(0, sirenDueAt - now),
+    ),
+    calling: setTimeout(
+      () => {
+        void advanceAlarmIncidentToStage(
+          receiverUid,
+          incidentId,
+          "calling",
+        );
+      },
+      Math.max(0, callDueAt - now),
+    ),
+    expire: setTimeout(
+      () => {
+        void expireAlarmIncident(
+          receiverUid,
+          incidentId,
+        );
+      },
+      Math.max(0, expireAt - now),
+    ),
+  };
+}
+
+async function startOrMergeAlarmIncidents(uid, items) {
+  const normalizedItems = normalizeAlarmIncidentItems(items);
+
+  if (normalizedItems.length === 0) {
+    return;
+  }
+
+  const groups = new Map();
+
+  for (const item of normalizedItems) {
+    const ownerUid = item.ownerUid || uid;
+    const flowType = getAlarmIncidentFlowType([item]);
+    const groupKey =
+      `${ownerUid}|${item.homeId}|${flowType}`;
+
+    if (!groups.has(groupKey)) {
+      groups.set(groupKey, []);
+    }
+
+    groups.get(groupKey).push(item);
+  }
+
+  for (const groupedItems of groups.values()) {
+    const firstItem = groupedItems[0];
+    const ownerUid = firstItem.ownerUid || uid;
+    const homeId = firstItem.homeId;
+    const homeName = firstItem.homeName || homeId;
+    const flowType =
+      getAlarmIncidentFlowType(groupedItems);
+
+    // SOS/khói/gas/ngập luôn được nhận.
+    const enabled = flowType === "emergency"
+      ? true
+      : await canReceiveAlarm(
+          uid,
+          homeId,
+          ownerUid,
+        );
+
+    if (!enabled) {
+      console.log(
+        "🔕 ALARM INCIDENT NOT CREATED:",
+        uid,
+        homeId,
+        flowType,
+      );
+      continue;
+    }
+
+    const targetKey = getAlarmIncidentTargetKey(
+      uid,
+      ownerUid,
+      homeId,
+      flowType,
+    );
+
+    const active = await getActiveAlarmIncident(
+      uid,
+      targetKey,
+    );
+
+    if (active) {
+      const now = Date.now();
+      const activeDetectedAt = Number(
+        active.incident.detectedAt ||
+        active.incident.createdAt ||
+        0,
+      );
+
+      const activeAgeMs = activeDetectedAt > 0
+        ? now - activeDetectedAt
+        : Number.POSITIVE_INFINITY;
+
+      const mergeWindowMs =
+        flowType === "emergency"
+          ? EMERGENCY_MERGE_WINDOW_MS
+          : SECURITY_MERGE_WINDOW_MS;
+
+      const mayMerge =
+        activeAgeMs >= 0 &&
+        activeAgeMs <= mergeWindowMs;
+
+      if (mayMerge) {
+        const mergedItems = normalizeAlarmIncidentItems([
+          ...(Array.isArray(active.incident.items)
+            ? active.incident.items
+            : []),
+          ...groupedItems,
+        ]);
+
+        await db
+          .ref(
+            `accounts/${uid}/alarmIncidents/${active.incidentId}`,
+          )
+          .update({
+            items: mergedItems,
+            reasons: mergedItems.map((item) => item.reason),
+            updatedAt: now,
+          });
+
+        console.log(
+          "➕ ALARM INCIDENT MERGED:",
+          uid,
+          active.incidentId,
+          flowType,
+          mergedItems.length,
+        );
+
+        continue;
+      }
+
+      // Incident cũ vẫn active có thể đã ở cấp cao hơn.
+      // Không được để lần kích hoạt mới bị gộp mãi vào incident cũ,
+      // vì như vậy notification và các cấp sau sẽ không chạy lại.
+      clearAlarmIncidentTimers(
+        uid,
+        active.incidentId,
+      );
+
+      await db
+        .ref(
+          `accounts/${uid}/alarmIncidents/${active.incidentId}`,
+        )
+        .update({
+          status: "superseded",
+          supersededAt: now,
+          supersededReason:
+            flowType === "emergency"
+              ? "new_emergency_trigger"
+              : "new_security_trigger",
+          callStatus:
+            active.incident.callStatus === "not_started"
+              ? "not_started"
+              : "superseded",
+          updatedAt: now,
+        });
+
+      console.log(
+        "🔁 OLD ALARM INCIDENT SUPERSEDED:",
+        uid,
+        active.incidentId,
+        flowType,
+        `age=${Math.round(activeAgeMs / 1000)}s`,
+      );
+    }
+
+    const incidentRef = db
+      .ref(`accounts/${uid}/alarmIncidents`)
+      .push();
+
+    const incidentId = incidentRef.key;
+
+    if (!incidentId) {
+      continue;
+    }
+
+    const now = Date.now();
+    const initialStage =
+      flowType === "emergency"
+        ? "notification"
+        : "detected";
+
+    const incident = {
+      incidentId,
+      targetKey,
+      receiverUid: uid,
+      ownerUid,
+      homeId,
+      homeName,
+      flowType,
+      status: "active",
+      stage: initialStage,
+      items: groupedItems,
+      reasons: groupedItems.map((item) => item.reason),
+      detectedAt: now,
+      expireAt:
+        now + ALARM_INCIDENT_AUTO_EXPIRE_MS,
+      callStatus: "not_started",
+      homeSirenStatus: "not_started",
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    if (flowType === "emergency") {
+      incident.fullscreenDueAt =
+        now + EMERGENCY_FULLSCREEN_DELAY_MS;
+      incident.callDueAt =
+        now + EMERGENCY_CALL_DELAY_MS;
+    } else {
+      incident.alarmDueAt =
+        now + ALARM_INCIDENT_ALARM_DELAY_MS;
+      incident.sirenDueAt =
+        now + ALARM_INCIDENT_SIREN_DELAY_MS;
+      incident.callDueAt =
+        now + ALARM_INCIDENT_CALL_DELAY_MS;
+    }
+
+    await db.ref().update({
+      [`accounts/${uid}/alarmIncidents/${incidentId}`]:
+        incident,
+      [`accounts/${uid}/activeAlarmIncidentByTarget/${targetKey}`]:
+        incidentId,
+    });
+
+    await addHomeNotificationFromBackend({
+      uid,
+      homeId,
+      homeName,
+      type: flowType === "emergency"
+        ? "emergency_detected"
+        : "alarm_detected",
+      category: "alarm",
+      severity: flowType === "emergency"
+        ? "critical"
+        : "warning",
+      title: flowType === "emergency"
+        ? getEmergencyIncidentTitle(groupedItems)
+        : "Phát hiện bất thường",
+      message:
+        groupedItems.map((item) => item.reason).join(", "),
+      entityType: "home",
+      entityId: homeId,
+    });
+
+    await sendAlarmStageSummary(
+      uid,
+      groupedItems,
+      {
+        incidentId,
+        stage: initialStage,
+        flowType,
+      },
+    );
+
+    scheduleAlarmIncidentStages(
+      uid,
+      incidentId,
+      incident,
+    );
+
+    if (flowType === "emergency") {
+      console.log(
+        "🆘 EMERGENCY INCIDENT DETECTED:",
+        uid,
+        incidentId,
+        homeId,
+        `fullscreen=${EMERGENCY_FULLSCREEN_DELAY_MS / 1000}s`,
+        `call=${EMERGENCY_CALL_DELAY_MS / 1000}s`,
+      );
+    } else {
+      console.log(
+        "🔎 ALARM INCIDENT DETECTED:",
+        uid,
+        incidentId,
+        homeId,
+        `alarm=${ALARM_INCIDENT_ALARM_DELAY_MS / 1000}s`,
+        `siren=${ALARM_INCIDENT_SIREN_DELAY_MS / 1000}s`,
+        `call=${ALARM_INCIDENT_CALL_DELAY_MS / 1000}s`,
+      );
+    }
+  }
+}
+
+async function resumeActiveAlarmIncidents() {
+  try {
+    const accountsSnap = await db
+      .ref("accounts")
+      .once("value");
+
+    const accounts = accountsSnap.val() || {};
+    let resumed = 0;
+
+    for (const [uid, account] of Object.entries(accounts)) {
+      const incidents = account?.alarmIncidents || {};
+
+      for (const [incidentId, incident] of Object.entries(incidents)) {
+        if (incident?.status !== "active") {
+          continue;
+        }
+
+        scheduleAlarmIncidentStages(
+          uid,
+          incidentId,
+          incident,
+        );
+        resumed++;
+      }
+    }
+
+    console.log(
+      "🚨 ACTIVE ALARM INCIDENTS RESUMED:",
+      resumed,
+    );
+  } catch (err) {
+    console.log(
+      "ALARM INCIDENT RESUME ERROR:",
+      err.message,
+    );
+  }
+}
+
+async function resolveAlarmIncidentsForHome({
+  ownerUid,
+  homeId,
+  resolvedBy,
+  action,
+}) {
+  const accountsSnap = await db
+    .ref("accounts")
+    .once("value");
+
+  const accounts = accountsSnap.val() || {};
+  const updates = {};
+  const resolved = [];
+  const now = Date.now();
+
+  for (const [uid, account] of Object.entries(accounts)) {
+    const incidents = account?.alarmIncidents || {};
+
+    for (const [incidentId, incident] of Object.entries(incidents)) {
+      if (
+        incident?.status !== "active" ||
+        String(incident.ownerUid || "") !== ownerUid ||
+        String(incident.homeId || "") !== homeId
+      ) {
+        continue;
+      }
+
+      updates[
+        `accounts/${uid}/alarmIncidents/${incidentId}/status`
+      ] = "resolved";
+      updates[
+        `accounts/${uid}/alarmIncidents/${incidentId}/stage`
+      ] = "resolved";
+      updates[
+        `accounts/${uid}/alarmIncidents/${incidentId}/resolvedAt`
+      ] = now;
+      updates[
+        `accounts/${uid}/alarmIncidents/${incidentId}/resolvedBy`
+      ] = resolvedBy;
+      updates[
+        `accounts/${uid}/alarmIncidents/${incidentId}/resolutionAction`
+      ] = action;
+      updates[
+        `accounts/${uid}/alarmIncidents/${incidentId}/updatedAt`
+      ] = now;
+      updates[
+        `accounts/${uid}/alarmIncidents/${incidentId}/homeSirenStatus`
+      ] = "stop_requested";
+
+      const targetKey = String(
+        incident.targetKey || "",
+      ).trim();
+
+      if (targetKey) {
+        updates[
+          `accounts/${uid}/activeAlarmIncidentByTarget/${targetKey}`
+        ] = null;
+      }
+
+      resolved.push({
+        uid,
+        incidentId,
+      });
+    }
+  }
+
+  if (resolved.length === 0) {
+    return 0;
+  }
+
+  await db.ref().update(updates);
+
+  for (const item of resolved) {
+    clearAlarmIncidentTimers(
+      item.uid,
+      item.incidentId,
+    );
+
+    await sendAlarmResolvedPush({
+      uid: item.uid,
+      incidentId: item.incidentId,
+      homeId,
+      resolvedBy,
+      action,
+    });
+  }
+
+  console.log(
+    "✅ ALARM INCIDENTS RESOLVED:",
+    ownerUid,
+    homeId,
+    resolved.length,
+    action,
+  );
+
+  return resolved.length;
+}
+
+async function sendAlarmSummary(uid, items) {
+  return sendAlarmStageSummary(
+    uid,
+    items,
+    {
+      stage: "alarm",
+    },
+  );
+}
+
 function queueEventAlarm(uid, item) {
+  const flowType = getAlarmIncidentFlowType([item]);
+
+  if (flowType === "emergency") {
+    void startOrMergeAlarmIncidents(
+      uid,
+      [item],
+    ).catch((error) => {
+      console.log(
+        "EMERGENCY INCIDENT START ERROR:",
+        uid,
+        error.message,
+      );
+    });
+
+    return;
+  }
+
   if (!pendingEventAlarmMap[uid]) {
     pendingEventAlarmMap[uid] = [];
   }
 
   const exists = pendingEventAlarmMap[uid].some((oldItem) => {
-    return oldItem.homeId === item.homeId && oldItem.reason === item.reason;
+    return (
+      oldItem.homeId === item.homeId &&
+      oldItem.reason === item.reason
+    );
   });
 
   if (!exists) {
@@ -954,15 +2361,19 @@ function queueEventAlarm(uid, item) {
     return;
   }
 
-  pendingEventAlarmTimerMap[uid] = setTimeout(async () => {
-    const items = pendingEventAlarmMap[uid] || [];
+  pendingEventAlarmTimerMap[uid] = setTimeout(
+    async () => {
+      const items = pendingEventAlarmMap[uid] || [];
 
-    delete pendingEventAlarmMap[uid];
-    delete pendingEventAlarmTimerMap[uid];
+      delete pendingEventAlarmMap[uid];
+      delete pendingEventAlarmTimerMap[uid];
 
-    await sendAlarmSummary(uid, items);
-  }, 1200);
+      await startOrMergeAlarmIncidents(uid, items);
+    },
+    1200,
+  );
 }
+
 // ================= SCHEDULE CHECK =================
 async function cleanupExpiredAlarmPause() {
   try {
@@ -1856,7 +3267,7 @@ async function checkScheduledAlarms() {
     }
 
     for (const [receiverUid, items] of Object.entries(alarmSummaryByUser)) {
-      await sendAlarmSummary(
+      await startOrMergeAlarmIncidents(
         receiverUid,
         items,
       );
@@ -2285,23 +3696,6 @@ async function sendChatNotificationPush({
     return;
   }
 
-  const tokenSnap = await db
-    .ref(`accounts/${receiverUid}/fcmToken`)
-    .once("value");
-
-  const token =
-    String(tokenSnap.val() || "").trim();
-
-  if (!token) {
-    console.log(
-      "❌ NO TOKEN FOR CHAT:",
-      receiverUid,
-      homeId,
-    );
-
-    return;
-  }
-
   const cleanHomeName =
     String(homeName || "").trim() || "HomeChat";
 
@@ -2334,37 +3728,45 @@ async function sendChatNotificationPush({
     clickAction: "home_chat",
   };
 
-  await admin.messaging().send({
-    token,
-    data,
+  const pushResult = await sendPushToUser(
+    receiverUid,
+    {
+      data,
 
-    android: {
-      priority: "high",
-    },
-
-    apns: {
-      headers: {
-        "apns-priority": "10",
+      android: {
+        priority: "high",
       },
-      payload: {
-        aps: {
-          alert: {
-            title,
-            body,
+
+      apns: {
+        headers: {
+          "apns-priority": "10",
+        },
+        payload: {
+          aps: {
+            alert: {
+              title,
+              body,
+            },
+            sound: "default",
+            badge: unreadCount,
+            threadId: `home_chat_${homeId}`,
           },
-          sound: "default",
-          badge: unreadCount,
-          threadId: `home_chat_${homeId}`,
         },
       },
     },
-  });
+    "CHAT",
+  );
+
+  if (pushResult.sent === 0) {
+    return;
+  }
 
   console.log(
     "💬 CHAT PUSH SENT:",
     receiverUid,
     homeId,
     unreadCount,
+    `devices=${pushResult.sent}`,
   );
 }
 
@@ -2377,8 +3779,14 @@ async function init() {
 
   await cleanupLegacySecurityScheduleState();
 
+  // Khôi phục các sự cố Alarm chưa được xử lý sau khi backend restart.
+  await resumeActiveAlarmIncidents();
+
   // Tự động chuyển Mode khi toàn bộ thành viên rời nhà.
   startAutoAwayMonitor({ db });
+
+  // Ghi nhịp sống của Raspberry Pi/backend lên Firebase.
+  startHubHeartbeat();
 
   setInterval(cleanupExpiredAlarmPause, 60000);
   setInterval(checkScheduledNotifications, 60000);
@@ -4040,12 +5448,172 @@ Nên trong khoảng thời gian này:
     );
   }
 });
+
+// ================= ALARM INCIDENT ACTION REQUEST =================
+db.ref("alarm_incident_action_requests").on(
+  "child_added",
+  async (snap) => {
+    const req = snap.val();
+    const requestId = snap.key;
+
+    async function reject(reason) {
+      console.log(
+        "❌ ALARM INCIDENT ACTION REJECTED:",
+        requestId,
+        reason,
+      );
+
+      try {
+        await snap.ref.remove();
+      } catch (_) { }
+    }
+
+    try {
+      if (!req || !requestId) {
+        return;
+      }
+
+      if (alarmIncidentActionInProgress.has(requestId)) {
+        return;
+      }
+
+      alarmIncidentActionInProgress.add(requestId);
+
+      const receiverUid = String(
+        req.receiverUid || "",
+      ).trim();
+      const incidentId = String(
+        req.incidentId || "",
+      ).trim();
+      const requestedBy = String(
+        req.requestedBy || "",
+      ).trim();
+      const action = String(
+        req.action || "",
+      ).trim();
+      const createdAt = Number(req.createdAt);
+      const now = Date.now();
+
+      const allowedActions = new Set([
+        "stop",
+        "check_home",
+        "resolve",
+      ]);
+
+      if (
+        req.status !== "pending" ||
+        !receiverUid ||
+        !incidentId ||
+        !requestedBy ||
+        !allowedActions.has(action) ||
+        !Number.isFinite(createdAt) ||
+        createdAt > now + 1000 ||
+        createdAt < now - 5 * 60 * 1000
+      ) {
+        await reject("INVALID DATA");
+        return;
+      }
+
+      const incidentSnap = await db
+        .ref(
+          `accounts/${receiverUid}/alarmIncidents/${incidentId}`,
+        )
+        .once("value");
+
+      const incident = incidentSnap.val();
+
+      if (!incident || incident.status !== "active") {
+        await reject("INCIDENT NOT ACTIVE");
+        return;
+      }
+
+      const ownerUid = String(
+        incident.ownerUid || "",
+      ).trim();
+      const homeId = String(
+        incident.homeId || "",
+      ).trim();
+
+      if (!ownerUid || !homeId) {
+        await reject("INVALID INCIDENT");
+        return;
+      }
+
+      let hasPermission = requestedBy === ownerUid;
+
+      if (!hasPermission) {
+        const [sharedHomeSnap, sharedMemberSnap] =
+          await Promise.all([
+            db
+              .ref(
+                `accounts/${requestedBy}/sharedHomes/${homeId}`,
+              )
+              .once("value"),
+            db
+              .ref(
+                `sharedByHome/${homeId}/${requestedBy}`,
+              )
+              .once("value"),
+          ]);
+
+        const sharedHome = sharedHomeSnap.val() || {};
+
+        hasPermission =
+          sharedHome.ownerUid === ownerUid &&
+          sharedMemberSnap.exists();
+      }
+
+      if (!hasPermission) {
+        await reject("NO PERMISSION");
+        return;
+      }
+
+      await resolveAlarmIncidentsForHome({
+        ownerUid,
+        homeId,
+        resolvedBy: requestedBy,
+        action,
+      });
+
+      await snap.ref.remove();
+    } catch (err) {
+      console.log(
+        "ALARM INCIDENT ACTION ERROR:",
+        requestId,
+        err.message,
+      );
+
+      try {
+        await snap.ref.remove();
+      } catch (_) { }
+    } finally {
+      if (requestId) {
+        alarmIncidentActionInProgress.delete(requestId);
+      }
+    }
+  },
+);
+
 init();
 
 // ================= MQTT CONNECT =================
 client.on("connect", () => {
+  mqttConnected = true;
+
   console.log("MQTT CONNECTED");
   client.subscribe("zigbee2mqtt/#");
+
+  // Cập nhật ngay để app biết MQTT đã hoạt động.
+  void writeHubHeartbeat();
+});
+
+client.on("offline", () => {
+  mqttConnected = false;
+  void writeHubHeartbeat();
+});
+
+client.on("close", () => {
+  mqttConnected = false;
 });
 
 // ================= PAIRING =================
