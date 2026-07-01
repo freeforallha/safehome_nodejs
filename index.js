@@ -4187,6 +4187,8 @@ async function startSecurityModeTransitionMonitor() {
 // ================= AUTO AWAY =================
 const AUTO_AWAY_ARM_DELAY_MS = 30 * 1000;
 const AUTO_AWAY_SCAN_INTERVAL_MS = 10 * 1000;
+const ACCOUNT_SESSION_STALE_MS =
+  45 * 24 * 60 * 60 * 1000;
 
 let autoAwayTimer = null;
 let autoAwayScanRunning = false;
@@ -4197,11 +4199,105 @@ function asObject(value) {
     : {};
 }
 
-function normalizePresenceState(
+function hasSecurityDevices(home) {
+  const devices = asObject(home?.devices);
+
+  return Object.values(devices).some((rawDevice) => {
+    const device = asObject(rawDevice);
+    const deviceType = String(
+      device.type || "unknown",
+    ).trim();
+
+    return isSecurityDeviceType(deviceType);
+  });
+}
+
+function getAccountSessionStatus(account, now) {
+  const sessions = Object.values(
+    asObject(account?.sessions),
+  ).map((rawSession) => asObject(rawSession));
+
+  if (sessions.length === 0) {
+    return {
+      active: false,
+      connected: false,
+      reason: "legacy_session_missing",
+      freshestSeenAt: 0,
+      appState: "",
+      signedInSessionCount: 0,
+    };
+  }
+
+  let signedInCount = 0;
+  let active = false;
+  let connected = false;
+  let freshestSeenAt = 0;
+  let freshestAppState = "";
+
+  for (const session of sessions) {
+    if (session.signedIn !== true) {
+      continue;
+    }
+
+    signedInCount++;
+
+    const lastSeenAt = Math.max(
+      Number(session.lastSeenAt || 0),
+      Number(session.lastLoginAt || 0),
+    );
+
+    if (lastSeenAt >= freshestSeenAt) {
+      freshestSeenAt = lastSeenAt;
+      freshestAppState = String(
+        session.appState || "",
+      ).trim();
+    }
+
+    const sessionIsActive =
+      lastSeenAt > 0 &&
+      now - lastSeenAt <= ACCOUNT_SESSION_STALE_MS;
+
+    if (!sessionIsActive) {
+      continue;
+    }
+
+    active = true;
+
+    if (session.connected === true) {
+      connected = true;
+    }
+  }
+
+  if (active) {
+    return {
+      active: true,
+      connected,
+      reason: "",
+      freshestSeenAt,
+      appState: freshestAppState,
+      signedInSessionCount: signedInCount,
+    };
+  }
+
+  return {
+    active: false,
+    connected: false,
+    reason:
+      signedInCount > 0
+        ? "session_stale"
+        : "signed_out",
+    freshestSeenAt,
+    appState: freshestAppState,
+    signedInSessionCount: signedInCount,
+  };
+}
+
+function getMemberPresenceStatus(
   accounts,
   memberUid,
   ownerUid,
   homeId,
+  sessionStatus,
 ) {
   const presence = asObject(
     accounts?.[memberUid]?.homePresence?.[homeId],
@@ -4215,19 +4311,81 @@ function normalizePresenceState(
     presence.homeId || "",
   ).trim();
 
-  const state = String(
+  const identityMatches =
+    storedOwnerUid === ownerUid &&
+    storedHomeId === homeId;
+
+  const rawState = String(
     presence.state || "unknown",
   ).trim();
 
-  if (
-    storedOwnerUid !== ownerUid ||
-    storedHomeId !== homeId ||
-    (state !== "inside" && state !== "outside")
-  ) {
-    return "unknown";
-  }
+  const event = String(
+    presence.event || "",
+  ).trim();
 
-  return state;
+  const monitoringBlockingReason = String(
+    presence.monitoringBlockingReason || "",
+  ).trim();
+
+  const explicitlySignedOut =
+    event === "signed_out" ||
+    monitoringBlockingReason === "signed_out";
+
+  const sessionActive =
+    sessionStatus?.active === true;
+
+  const hasKnownState =
+    rawState === "inside" ||
+    rawState === "outside";
+
+  const monitoringEligible =
+    presence.monitoringEligible !== false;
+
+  const state =
+    identityMatches &&
+    sessionActive &&
+    !explicitlySignedOut &&
+    hasKnownState
+      ? rawState
+      : "unknown";
+
+  // Chỉ thành viên có session còn đáng tin và có trạng thái
+  // inside/outside rõ ràng mới tham gia phép tính Auto Away.
+  // unknown được loại ra, không chặn các thành viên còn lại.
+  const eligibleForArming =
+    identityMatches &&
+    sessionActive &&
+    !explicitlySignedOut &&
+    monitoringEligible &&
+    hasKnownState;
+
+  const unknownWhileMonitored =
+    identityMatches &&
+    sessionActive &&
+    !explicitlySignedOut &&
+    monitoringEligible &&
+    !hasKnownState;
+
+  const sessionReason = explicitlySignedOut
+    ? "signed_out"
+    : String(sessionStatus?.reason || "").trim();
+
+  return {
+    identityMatches,
+    eligibleForArming,
+    unknownWhileMonitored,
+    sessionActive,
+    sessionReason,
+    needsSessionCleanup:
+      identityMatches &&
+      (!sessionActive || explicitlySignedOut),
+    state,
+    rawState,
+    event,
+    monitoringEligible,
+    monitoringBlockingReason,
+    updatedAt: Number(presence.updatedAt || 0),
+  };
 }
 
 function runtimeSignature(runtime) {
@@ -4235,63 +4393,122 @@ function runtimeSignature(runtime) {
 
   return JSON.stringify({
     status: String(value.status || ""),
+    totalMemberCount: Number(value.totalMemberCount || 0),
     memberCount: Number(value.memberCount || 0),
+    excludedCount: Number(value.excludedCount || 0),
     insideCount: Number(value.insideCount || 0),
     outsideCount: Number(value.outsideCount || 0),
     unknownCount: Number(value.unknownCount || 0),
     allOutsideSince: Number(value.allOutsideSince || 0),
     cycleArmed: value.cycleArmed === true,
+    insideOverrideUid: String(
+      value.insideOverrideUid || "",
+    ),
+    insideOverrideAt: Number(
+      value.insideOverrideAt || 0,
+    ),
   });
 }
 
 function buildRuntime({
   status,
+  totalMemberCount,
   memberCount,
+  excludedCount,
   insideCount,
   outsideCount,
   unknownCount,
   allOutsideSince,
   cycleArmed,
+  insideOverrideUid = "",
+  insideOverrideAt = 0,
   now,
 }) {
   return {
     status,
+    totalMemberCount,
     memberCount,
+    excludedCount,
     insideCount,
     outsideCount,
     unknownCount,
     allOutsideSince: allOutsideSince || null,
     cycleArmed: cycleArmed === true,
+    insideOverrideUid:
+      String(insideOverrideUid || "").trim() || null,
+    insideOverrideAt:
+      Number(insideOverrideAt || 0) || null,
     updatedAt: now,
   };
 }
-
 
 function presenceSummarySignature(summary) {
   const value = asObject(summary);
 
   return JSON.stringify({
+    totalMemberCount: Number(value.totalMemberCount || 0),
+    signedInCount: Number(value.signedInCount || 0),
+    onlineCount: Number(value.onlineCount || 0),
+    connectedCount: Number(value.connectedCount || 0),
     memberCount: Number(value.memberCount || 0),
+    excludedCount: Number(value.excludedCount || 0),
     insideCount: Number(value.insideCount || 0),
     outsideCount: Number(value.outsideCount || 0),
     unknownCount: Number(value.unknownCount || 0),
+    unavailableCount: Number(value.unavailableCount || 0),
   });
 }
 
 function buildPresenceSummary({
+  totalMemberCount,
+  signedInCount,
+  onlineCount,
+  connectedCount,
   memberCount,
+  excludedCount,
   insideCount,
   outsideCount,
   unknownCount,
+  unavailableCount,
   now,
 }) {
   return {
+    totalMemberCount,
+    signedInCount,
+    onlineCount,
+    connectedCount,
     memberCount,
+    excludedCount,
     insideCount,
     outsideCount,
     unknownCount,
+    unavailableCount,
     updatedAt: now,
   };
+}
+
+function memberPresenceStatusSignature(statusMap) {
+  const normalized = {};
+
+  for (const memberUid of Object.keys(
+    asObject(statusMap),
+  ).sort()) {
+    const value = asObject(statusMap[memberUid]);
+
+    normalized[memberUid] = {
+      online: value.online === true,
+      connected: value.connected === true,
+      state: String(value.state || "unknown"),
+      locationKnown: value.locationKnown === true,
+      monitoringEligible:
+        value.monitoringEligible === true,
+      appState: String(value.appState || ""),
+      reason: String(value.reason || ""),
+      lastSeenAt: Number(value.lastSeenAt || 0),
+    };
+  }
+
+  return JSON.stringify(normalized);
 }
 
 async function checkAutoAwayHomes(db) {
@@ -4313,6 +4530,17 @@ async function checkAutoAwayHomes(db) {
     const now = Date.now();
     const updates = {};
     const logs = [];
+    const sessionStatusByUid = new Map();
+
+    for (const [accountUid, rawAccount] of Object.entries(accounts)) {
+      sessionStatusByUid.set(
+        accountUid,
+        getAccountSessionStatus(
+          asObject(rawAccount),
+          now,
+        ),
+      );
+    }
 
     for (const [ownerUid, rawAccount] of Object.entries(accounts)) {
       const account = asObject(rawAccount);
@@ -4329,48 +4557,157 @@ async function checkAutoAwayHomes(db) {
           `${homePath}/autoAwayRuntime`;
         const presenceSummaryPath =
           `${homePath}/presenceSummary`;
+        const memberPresenceStatusPath =
+          `${homePath}/memberPresenceStatus`;
 
         const members = new Set([ownerUid]);
         const sharedMembers = asObject(sharedByHome[homeId]);
 
-        for (const memberUid of Object.keys(sharedMembers)) {
-          if (memberUid.trim() !== "") {
+        for (const rawMemberUid of Object.keys(sharedMembers)) {
+          const memberUid = String(rawMemberUid || "").trim();
+
+          if (memberUid) {
             members.add(memberUid);
           }
         }
 
-        const states = [];
+        const eligibleStates = [];
+        const memberPresenceByUid = new Map();
+        const nextMemberPresenceStatus = {};
+        let excludedCount = 0;
+        let unknownCount = 0;
+        let signedInCount = 0;
+        let connectedCount = 0;
 
         for (const memberUid of members) {
-          states.push(
-            normalizePresenceState(
-              accounts,
-              memberUid,
-              ownerUid,
-              homeId,
-            ),
+          const sessionStatus =
+            sessionStatusByUid.get(memberUid) ||
+            getAccountSessionStatus(
+              asObject(accounts?.[memberUid]),
+              now,
+            );
+
+          const presenceStatus = getMemberPresenceStatus(
+            accounts,
+            memberUid,
+            ownerUid,
+            homeId,
+            sessionStatus,
           );
+
+          memberPresenceByUid.set(
+            memberUid,
+            presenceStatus,
+          );
+
+          if (sessionStatus.active === true) {
+            signedInCount++;
+          }
+
+          if (sessionStatus.connected === true) {
+            connectedCount++;
+          }
+
+          const locationKnown =
+            presenceStatus.state === "inside" ||
+            presenceStatus.state === "outside";
+
+          nextMemberPresenceStatus[memberUid] = {
+            online: sessionStatus.active === true,
+            connected: sessionStatus.connected === true,
+            state: presenceStatus.state,
+            locationKnown,
+            monitoringEligible:
+              presenceStatus.eligibleForArming === true,
+            appState: String(
+              sessionStatus.appState || "",
+            ).trim(),
+            reason:
+              sessionStatus.active === true
+                ? String(
+                    presenceStatus.monitoringBlockingReason || "",
+                  ).trim()
+                : String(
+                    presenceStatus.sessionReason || "signed_out",
+                  ).trim(),
+            lastSeenAt: Number(
+              sessionStatus.freshestSeenAt || 0,
+            ),
+            updatedAt: now,
+          };
+
+          if (presenceStatus.needsSessionCleanup) {
+            const reason =
+              presenceStatus.sessionReason ||
+              "session_stale";
+
+            const presencePath =
+              `accounts/${memberUid}/homePresence/${homeId}`;
+
+            const cleanupChanged =
+              presenceStatus.rawState !== "unknown" ||
+              presenceStatus.event !== reason ||
+              presenceStatus.monitoringEligible !== false ||
+              presenceStatus.monitoringBlockingReason !== reason;
+
+            if (cleanupChanged) {
+              updates[`${presencePath}/state`] = "unknown";
+              updates[`${presencePath}/event`] = reason;
+              updates[`${presencePath}/source`] =
+                "native_geofence";
+              updates[`${presencePath}/updatedAt`] = now;
+              updates[`${presencePath}/monitoringEligible`] = false;
+              updates[`${presencePath}/monitoringBlockingReason`] =
+                reason;
+              updates[`${presencePath}/monitoringCheckedAt`] = now;
+
+              logs.push(
+                `👤 SESSION INACTIVE → UNKNOWN: ${memberUid} ${homeId} reason=${reason}`,
+              );
+            }
+          }
+
+          if (!presenceStatus.eligibleForArming) {
+            excludedCount++;
+
+            if (presenceStatus.unknownWhileMonitored) {
+              unknownCount++;
+            }
+
+            continue;
+          }
+
+          eligibleStates.push(presenceStatus.state);
         }
 
-        const memberCount = states.length;
-        const insideCount = states.filter(
+        const totalMemberCount = members.size;
+        const memberCount = eligibleStates.length;
+        const insideCount = eligibleStates.filter(
           (state) => state === "inside",
         ).length;
-        const outsideCount = states.filter(
+        const outsideCount = eligibleStates.filter(
           (state) => state === "outside",
         ).length;
-        const unknownCount =
-          memberCount - insideCount - outsideCount;
+        const unavailableCount = Math.max(
+          0,
+          signedInCount - memberCount,
+        );
 
         const currentPresenceSummary =
           asObject(home.presenceSummary);
 
         const nextPresenceSummary =
           buildPresenceSummary({
+            totalMemberCount,
+            signedInCount,
+            onlineCount: signedInCount,
+            connectedCount,
             memberCount,
+            excludedCount,
             insideCount,
             outsideCount,
             unknownCount,
+            unavailableCount,
             now,
           });
 
@@ -4380,6 +4717,56 @@ async function checkAutoAwayHomes(db) {
         ) {
           updates[presenceSummaryPath] =
             nextPresenceSummary;
+        }
+
+        const currentMemberPresenceStatus =
+          asObject(home.memberPresenceStatus);
+
+        if (
+          memberPresenceStatusSignature(
+            currentMemberPresenceStatus,
+          ) !==
+          memberPresenceStatusSignature(
+            nextMemberPresenceStatus,
+          )
+        ) {
+          updates[memberPresenceStatusPath] =
+            nextMemberPresenceStatus;
+        }
+
+        // Mode Bảo vệ thủ công là một khóa ưu tiên cao nhất:
+        // - Auto Away không được tự đổi Mode về Bình thường.
+        // - Auto Away cũng không được ghi đè nguồn manual.
+        // - Xóa toàn bộ chu kỳ Auto Away cũ để khi người dùng
+        //   chủ động chuyển về Bình thường, hệ thống bắt đầu
+        //   một chu kỳ rời nhà mới từ đầu.
+        if (
+          String(home.securityModeSource || "").trim() ===
+          "manual"
+        ) {
+          const nextRuntime = buildRuntime({
+            status: "manual_override",
+            totalMemberCount,
+            memberCount,
+            excludedCount,
+            insideCount,
+            outsideCount,
+            unknownCount,
+            allOutsideSince: 0,
+            cycleArmed: false,
+            insideOverrideUid: "",
+            insideOverrideAt: 0,
+            now,
+          });
+
+          if (
+            runtimeSignature(runtime) !==
+            runtimeSignature(nextRuntime)
+          ) {
+            updates[runtimePath] = nextRuntime;
+          }
+
+          continue;
         }
 
         if (autoAway.enabled !== true) {
@@ -4402,21 +4789,180 @@ async function checkAutoAwayHomes(db) {
           continue;
         }
 
-        const anyInside = insideCount > 0;
-        const allOutside =
-          memberCount > 0 && outsideCount === memberCount;
+        // Nhà không có sensor thuộc nhóm an ninh không được tự bật
+        // Mode Bảo vệ. Sensor môi trường/hạ tầng không được tính.
+        if (!hasSecurityDevices(home)) {
+          if (Object.keys(runtime).length > 0) {
+            updates[runtimePath] = null;
+          }
 
-        let nextRuntime;
+          if (
+            home.securityMode === "armed" &&
+            home.securityModeSource === "auto_away"
+          ) {
+            updates[`${homePath}/securityMode`] = "normal";
+            updates[`${homePath}/securityModeSource`] = null;
 
-        if (anyInside) {
-          nextRuntime = buildRuntime({
-            status: "inside",
+            logs.push(
+              `🏠 AUTO AWAY NO SECURITY DEVICES → NORMAL: ${ownerUid} ${homeId}`,
+            );
+          }
+
+          continue;
+        }
+
+        // Không còn ai đủ điều kiện theo dõi nền thì không được tự bật
+        // Bảo vệ. Những người thiếu quyền/tự khởi chạy/miễn tối ưu pin
+        // đã được loại khỏi memberCount ở phía trên.
+        if (memberCount === 0) {
+          const nextRuntime = buildRuntime({
+            status: "waiting_monitoring",
+            totalMemberCount,
             memberCount,
+            excludedCount,
             insideCount,
             outsideCount,
             unknownCount,
             allOutsideSince: 0,
             cycleArmed: false,
+            now,
+          });
+
+          if (
+            runtimeSignature(runtime) !==
+            runtimeSignature(nextRuntime)
+          ) {
+            updates[runtimePath] = nextRuntime;
+          }
+
+          if (
+            home.securityMode === "armed" &&
+            home.securityModeSource === "auto_away"
+          ) {
+            updates[`${homePath}/securityMode`] = "normal";
+            updates[`${homePath}/securityModeSource`] = null;
+
+            logs.push(
+              `🏠 AUTO AWAY NO ELIGIBLE MEMBERS → NORMAL: ${ownerUid} ${homeId}`,
+            );
+          }
+
+          continue;
+        }
+
+        const eligibleMemberInside =
+          insideCount > 0;
+
+        const storedInsideOverrideUid = String(
+          runtime.insideOverrideUid || "",
+        ).trim();
+
+        const storedInsideOverrideAt = Number(
+          runtime.insideOverrideAt || 0,
+        );
+
+        const storedOverridePresence =
+          storedInsideOverrideUid
+            ? memberPresenceByUid.get(
+                storedInsideOverrideUid,
+              )
+            : null;
+
+        // Khi một người bị loại khỏi phép tính BẬT Auto Away
+        // thực sự đi vào nhà, giữ Mode Bình thường cho tới khi
+        // trạng thái của người đó đổi khỏi inside.
+        const storedInsideOverrideActive =
+          storedInsideOverrideUid &&
+          storedInsideOverrideAt > 0 &&
+          storedOverridePresence &&
+          storedOverridePresence.identityMatches === true &&
+          storedOverridePresence.state === "inside" &&
+          storedOverridePresence.updatedAt >=
+            storedInsideOverrideAt;
+
+        const awayCycleStartedAt = Number(
+          runtime.allOutsideSince || 0,
+        );
+
+        let newInsideOverrideUid = "";
+        let newInsideOverrideAt = 0;
+
+        // Không dùng dữ liệu inside cũ để chặn Auto Away.
+        // Chỉ nhận enter/initial_sync xảy ra sau khi chu kỳ
+        // tất cả thành viên đủ điều kiện đã rời nhà bắt đầu.
+        if (
+          !storedInsideOverrideActive &&
+          awayCycleStartedAt > 0
+        ) {
+          for (const [memberUid, presenceStatus] of
+            memberPresenceByUid.entries()) {
+            if (
+              presenceStatus.eligibleForArming ||
+              !presenceStatus.identityMatches ||
+              presenceStatus.state !== "inside" ||
+              presenceStatus.updatedAt <
+                awayCycleStartedAt ||
+              (
+                presenceStatus.event !== "enter" &&
+                presenceStatus.event !== "initial_sync"
+              )
+            ) {
+              continue;
+            }
+
+            if (
+              presenceStatus.updatedAt >
+              newInsideOverrideAt
+            ) {
+              newInsideOverrideUid = memberUid;
+              newInsideOverrideAt =
+                presenceStatus.updatedAt;
+            }
+          }
+        }
+
+        const excludedMemberInside =
+          storedInsideOverrideActive ||
+          newInsideOverrideUid !== "";
+
+        const anyInsideForNormalMode =
+          eligibleMemberInside ||
+          excludedMemberInside;
+
+        const allOutside =
+          outsideCount === memberCount;
+
+        let nextRuntime;
+
+        if (anyInsideForNormalMode) {
+          const activeInsideOverrideUid =
+            storedInsideOverrideActive
+              ? storedInsideOverrideUid
+              : newInsideOverrideUid;
+
+          const activeInsideOverrideAt =
+            storedInsideOverrideActive
+              ? storedInsideOverrideAt
+              : newInsideOverrideAt;
+
+          nextRuntime = buildRuntime({
+            status:
+              excludedMemberInside &&
+              !eligibleMemberInside
+                ? "inside_unmonitored"
+                : "inside",
+            totalMemberCount,
+            memberCount,
+            excludedCount,
+            insideCount,
+            outsideCount,
+            unknownCount,
+            allOutsideSince: 0,
+            cycleArmed: false,
+            insideOverrideUid:
+              activeInsideOverrideUid,
+            insideOverrideAt:
+              activeInsideOverrideAt,
             now,
           });
 
@@ -4428,18 +4974,25 @@ async function checkAutoAwayHomes(db) {
             updates[`${homePath}/securityModeSource`] = null;
 
             logs.push(
-              `🏠 AUTO AWAY MEMBER RETURNED → NORMAL: ${ownerUid} ${homeId}`,
+              excludedMemberInside &&
+              !eligibleMemberInside
+                ? `🏠 AUTO AWAY UNMONITORED MEMBER RETURNED → NORMAL: ${ownerUid} ${homeId} member=${activeInsideOverrideUid}`
+                : `🏠 AUTO AWAY MEMBER RETURNED → NORMAL: ${ownerUid} ${homeId}`,
             );
           }
         } else if (!allOutside) {
           nextRuntime = buildRuntime({
             status: "waiting_presence",
+            totalMemberCount,
             memberCount,
+            excludedCount,
             insideCount,
             outsideCount,
             unknownCount,
             allOutsideSince: 0,
-            cycleArmed: runtime.cycleArmed === true,
+            cycleArmed: false,
+            insideOverrideUid: "",
+            insideOverrideAt: 0,
             now,
           });
         } else {
@@ -4464,7 +5017,7 @@ async function checkAutoAwayHomes(db) {
               updates[`${homePath}/securityModeSource`] = "auto_away";
 
               logs.push(
-                `🛡️ AUTO AWAY ARMED: ${ownerUid} ${homeId} members=${memberCount}`,
+                `🛡️ AUTO AWAY ARMED: ${ownerUid} ${homeId} eligible=${memberCount} excluded=${excludedCount}`,
               );
             } else {
               logs.push(
@@ -4475,12 +5028,16 @@ async function checkAutoAwayHomes(db) {
 
           nextRuntime = buildRuntime({
             status: cycleArmed ? "armed" : "countdown",
+            totalMemberCount,
             memberCount,
+            excludedCount,
             insideCount,
             outsideCount,
             unknownCount,
             allOutsideSince,
             cycleArmed,
+            insideOverrideUid: "",
+            insideOverrideAt: 0,
             now,
           });
         }
@@ -4524,6 +5081,7 @@ function startAutoAwayMonitor({ db }) {
     "📍 AUTO AWAY MONITOR STARTED:",
     `delay=${AUTO_AWAY_ARM_DELAY_MS / 1000}s`,
     `scan=${AUTO_AWAY_SCAN_INTERVAL_MS / 1000}s`,
+    `sessionStale=${ACCOUNT_SESSION_STALE_MS / 86400000}d`,
   );
 
   void checkAutoAwayHomes(db);
