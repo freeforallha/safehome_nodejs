@@ -363,22 +363,402 @@ function getHomeNotificationSafety(home) {
     unsafeDevices,
   };
 }
-function getDeviceTypeFromModel(modelId, description, ieee) {
-  const id = (ieee || "").toLowerCase();
-  const model = (modelId || "").toLowerCase();
-  const desc = (description || "").toLowerCase();
+function includesAny(text, keywords) {
+  return keywords.some((keyword) => {
+    return text.includes(keyword);
+  });
+}
 
+function isActiveSignal(value) {
+  if (value === true || value === 1) {
+    return true;
+  }
+
+  const normalized = String(value || "")
+    .trim()
+    .toLowerCase();
+
+  return (
+    normalized === "true" ||
+    normalized === "1" ||
+    normalized === "on" ||
+    normalized === "active" ||
+    normalized === "alarm" ||
+    normalized === "detected" ||
+    normalized === "triggered" ||
+    normalized === "emergency" ||
+    normalized === "unsafe" ||
+    normalized === "open" ||
+    normalized === "unlocked"
+  );
+}
+
+function normalizeLockState(device) {
+  const raw =
+    device?.lock_state ??
+    device?.lockState ??
+    device?.lock ??
+    device?.state;
+
+  if (raw === true || raw === 1) {
+    return "locked";
+  }
+
+  if (raw === false || raw === 0) {
+    return "unlocked";
+  }
+
+  const normalized = String(raw || "")
+    .trim()
+    .toLowerCase();
+
+  if (
+    normalized === "lock" ||
+    normalized === "locked" ||
+    normalized === "closed"
+  ) {
+    return "locked";
+  }
+
+  if (
+    normalized === "unlock" ||
+    normalized === "unlocked" ||
+    normalized === "open"
+  ) {
+    return "unlocked";
+  }
+
+  return "";
+}
+
+function inferDeviceTypeFromPayload(
+  data,
+  currentType = "unknown",
+) {
+  const normalizedCurrentType = String(
+    currentType || "unknown",
+  ).trim();
+
+  if (
+    normalizedCurrentType &&
+    normalizedCurrentType !== "unknown"
+  ) {
+    return normalizedCurrentType;
+  }
+
+  if (data.smoke !== undefined) {
+    return "smoke";
+  }
+
+  if (
+    data.carbon_monoxide !== undefined ||
+    data.co_alarm !== undefined
+  ) {
+    return "carbon_monoxide";
+  }
+
+  if (
+    data.gas !== undefined ||
+    data.gas_alarm !== undefined
+  ) {
+    return "gas";
+  }
+
+  if (
+    data.water_leak !== undefined ||
+    data.leak !== undefined ||
+    data.water !== undefined
+  ) {
+    return "water_leak";
+  }
+
+  if (
+    data.heat !== undefined ||
+    data.heat_alarm !== undefined ||
+    data.high_temperature_alarm !== undefined
+  ) {
+    return "heat";
+  }
+
+  if (
+    data.occupancy !== undefined ||
+    data.motion !== undefined
+  ) {
+    return "motion";
+  }
+
+  if (data.presence !== undefined) {
+    return "presence";
+  }
+
+  if (
+    data.vibration !== undefined ||
+    data.vibration_strength !== undefined
+  ) {
+    return "vibration";
+  }
+
+  if (data.contact !== undefined) {
+    return "door";
+  }
+
+  if (
+    data.power !== undefined ||
+    data.current !== undefined ||
+    data.voltage !== undefined ||
+    data.energy !== undefined
+  ) {
+    return "smart_plug";
+  }
+
+  if (
+    data.temperature !== undefined ||
+    data.humidity !== undefined
+  ) {
+    return "temperature";
+  }
+
+  return "unknown";
+}
+
+function getDeviceTypeFromModel(modelId, description, ieee) {
+  const id = String(ieee || "").trim().toLowerCase();
+  const model = String(modelId || "").trim().toLowerCase();
+  const desc = String(description || "").trim().toLowerCase();
+  const searchable = `${model} ${desc}`;
+
+  // Các thiết bị đang dùng thực tế.
   if (id === "0xa4c1388295d25926") return "smoke";
   if (id === "0xa4c138b872c891a2") return "temperature";
   if (id === "0xa4c1381162d4d15b") return "sos";
   if (id === "0xa4c13898b084dbdc") return "repeater";
 
-  if (desc.includes("smoke") || model.includes("ts0205")) return "smoke";
-  if (desc.includes("temperature") || desc.includes("humidity")) return "temperature";
-  if (desc.includes("sos") || desc.includes("button")) return "sos";
-  if (desc.includes("repeater") || model.includes("ts0207")) return "repeater";
+  // Loại cụ thể phải được kiểm tra trước loại chung.
+  if (
+    includesAny(searchable, [
+      "smart lock",
+      "door lock",
+      "deadbolt",
+      "keyless lock",
+      "electronic lock",
+    ])
+  ) {
+    return "door_lock";
+  }
 
-  return "door";
+  if (
+    includesAny(searchable, [
+      "glass break",
+      "glassbreak",
+      "broken glass",
+    ])
+  ) {
+    return "glass_break";
+  }
+
+  if (
+    includesAny(searchable, [
+      "carbon monoxide",
+      "carbon-monoxide",
+      "co alarm",
+      "co sensor",
+    ]) &&
+    !searchable.includes("co2")
+  ) {
+    return "carbon_monoxide";
+  }
+
+  if (
+    includesAny(searchable, [
+      "water leak",
+      "water leakage",
+      "leak sensor",
+      "flood sensor",
+      "water sensor",
+    ])
+  ) {
+    return "water_leak";
+  }
+
+  if (
+    includesAny(searchable, [
+      "combustible gas",
+      "natural gas",
+      "gas detector",
+      "gas sensor",
+      "methane",
+      "lpg",
+    ])
+  ) {
+    return "gas";
+  }
+
+  if (
+    includesAny(searchable, [
+      "heat detector",
+      "heat alarm",
+      "temperature alarm",
+    ])
+  ) {
+    return "heat";
+  }
+
+  if (
+    includesAny(searchable, [
+      "smoke",
+      "fire detector",
+      "fire alarm",
+    ]) ||
+    model.includes("ts0205")
+  ) {
+    return "smoke";
+  }
+
+  if (
+    includesAny(searchable, [
+      "presence sensor",
+      "human presence",
+      "mmwave",
+      "radar presence",
+    ])
+  ) {
+    return "presence";
+  }
+
+  if (
+    includesAny(searchable, [
+      "motion sensor",
+      "pir sensor",
+      "occupancy sensor",
+      "motion detector",
+    ]) ||
+    model.includes("snzb-03") ||
+    model.includes("ts0202")
+  ) {
+    return "motion";
+  }
+
+  if (
+    includesAny(searchable, [
+      "vibration",
+      "shock sensor",
+      "tilt sensor",
+    ]) ||
+    model.includes("djt11lm")
+  ) {
+    return "vibration";
+  }
+
+  if (
+    includesAny(searchable, [
+      "door contact",
+      "window contact",
+      "contact sensor",
+      "door sensor",
+      "window sensor",
+      "open close sensor",
+    ]) ||
+    model.includes("snzb-04") ||
+    model.includes("ts0203")
+  ) {
+    if (desc.includes("window")) return "window";
+    return "door";
+  }
+
+  if (
+    includesAny(searchable, [
+      "panic button",
+      "sos",
+      "emergency button",
+    ])
+  ) {
+    return "sos";
+  }
+
+  if (
+    includesAny(searchable, [
+      "smart plug",
+      "smart socket",
+      "wall plug",
+      "power outlet",
+      "socket outlet",
+    ]) ||
+    model.includes("ts011f")
+  ) {
+    return "smart_plug";
+  }
+
+  if (
+    includesAny(searchable, [
+      "power monitor",
+      "energy monitor",
+      "clamp meter",
+    ])
+  ) {
+    return "power_monitor";
+  }
+
+  if (includesAny(searchable, ["ups", "backup power"])) {
+    return "ups";
+  }
+
+  if (
+    includesAny(searchable, [
+      "siren",
+      "alarm bell",
+      "warning horn",
+    ])
+  ) {
+    return "siren";
+  }
+
+  if (
+    includesAny(searchable, [
+      "water valve",
+      "gas valve",
+      "valve controller",
+      "smart valve",
+    ])
+  ) {
+    return "smart_valve";
+  }
+
+  if (includesAny(searchable, ["doorbell", "video bell"])) {
+    return "doorbell";
+  }
+
+  if (includesAny(searchable, ["camera", "ip cam"])) {
+    return "camera";
+  }
+
+  if (includesAny(searchable, ["keypad", "key fob"])) {
+    return "keypad";
+  }
+
+  if (
+    includesAny(searchable, [
+      "temperature",
+      "humidity",
+      "thermometer",
+      "hygrometer",
+    ])
+  ) {
+    return "temperature";
+  }
+
+  if (
+    includesAny(searchable, [
+      "repeater",
+      "range extender",
+      "signal extender",
+    ])
+  ) {
+    return "repeater";
+  }
+
+  // Không mặc định thành cửa để tránh một thiết bị lạ
+  // vô tình tạo Alarm sai.
+  return "unknown";
 }
 // ================= DEVICE LISTENER =================
 function startDeviceMapListener() {
@@ -1294,6 +1674,14 @@ function getEmergencyIncidentTitle(items) {
     return "🔥 CẢNH BÁO KHÓI / CHÁY";
   }
 
+  if (types.has("heat")) {
+    return "🌡️ CẢNH BÁO NHIỆT ĐỘ NGUY HIỂM";
+  }
+
+  if (types.has("carbon_monoxide")) {
+    return "☠️ CẢNH BÁO KHÍ CO";
+  }
+
   if (types.has("gas")) {
     return "⚠️ CẢNH BÁO RÒ RỈ GAS";
   }
@@ -1406,6 +1794,16 @@ async function sendAlarmStageSummary(
       apnsSound = "default";
     }
 
+    // Incident được nhóm theo từng nhà, nên dù có nhiều sensor
+    // thì homeId/ownerUid vẫn phải luôn có để app xác nhận đúng sự cố.
+    const incidentHomeId = String(
+      allowedItems[0]?.homeId || "",
+    );
+
+    const incidentOwnerUid = String(
+      allowedItems[0]?.ownerUid || "",
+    );
+
     const message = {
       data: {
         type,
@@ -1415,14 +1813,8 @@ async function sendAlarmStageSummary(
         incidentId: String(incidentId || ""),
         alarmStage: stage,
         alarmFlowType: flowType,
-        homeId:
-          allowedItems.length === 1
-            ? allowedItems[0].homeId
-            : "",
-        ownerUid:
-          allowedItems.length === 1
-            ? allowedItems[0].ownerUid || ""
-            : "",
+        homeId: incidentHomeId,
+        ownerUid: incidentOwnerUid,
         clickAction,
       },
       android: {
@@ -2707,13 +3099,18 @@ function isSecurityDeviceType(deviceType) {
     deviceType === "gate" ||
     deviceType === "lock" ||
     deviceType === "door_lock" ||
-    deviceType === "motion"
+    deviceType === "motion" ||
+    deviceType === "presence" ||
+    deviceType === "vibration" ||
+    deviceType === "glass_break"
   );
 }
 
 function isEmergencyDeviceType(deviceType) {
   return (
     deviceType === "smoke" ||
+    deviceType === "heat" ||
+    deviceType === "carbon_monoxide" ||
     deviceType === "gas" ||
     deviceType === "water_leak" ||
     deviceType === "flood" ||
@@ -2821,17 +3218,37 @@ function getUnsafeSecurityReason(
   }
 
   if (
-    deviceType === "motion" &&
     (
-      device.occupancy === true ||
-      device.motion === true ||
-      device.presence === true
+      deviceType === "motion" ||
+      deviceType === "presence"
+    ) &&
+    (
+      isActiveSignal(device.occupancy) ||
+      isActiveSignal(device.motion) ||
+      isActiveSignal(device.presence)
     )
   ) {
     return `${deviceName}: Phát hiện chuyển động`;
   }
 
-  if (device.contact === false) {
+  if (
+    (
+      deviceType === "door_lock" ||
+      deviceType === "lock"
+    ) &&
+    normalizeLockState(device) === "unlocked"
+  ) {
+    return `${deviceName}: Khóa đang mở`;
+  }
+
+  if (
+    (
+      deviceType === "door" ||
+      deviceType === "window" ||
+      deviceType === "gate"
+    ) &&
+    device.contact === false
+  ) {
     return `${deviceName}: Cửa đang mở`;
   }
 
@@ -2900,15 +3317,81 @@ async function processScheduleAlarmsForOwner(
     }
 
     if (
+      deviceType === "heat" &&
+      (
+        (
+          isActiveSignal(updateData.heat) &&
+          !isActiveSignal(oldDevice.heat)
+        ) ||
+        (
+          isActiveSignal(updateData.heat_alarm) &&
+          !isActiveSignal(oldDevice.heat_alarm)
+        ) ||
+        (
+          isActiveSignal(
+            updateData.high_temperature_alarm,
+          ) &&
+          !isActiveSignal(
+            oldDevice.high_temperature_alarm,
+          )
+        )
+      )
+    ) {
+      queueEventAlarm(receiverUid, {
+        ownerUid,
+        homeId,
+        homeName,
+        deviceName,
+        type: deviceType,
+        reason: `${deviceName}: Phát hiện nhiệt độ nguy hiểm`,
+        repeatMinutes: 0,
+        nextAlarm: "ngay lập tức",
+      });
+
+      return;
+    }
+
+    if (
+      deviceType === "carbon_monoxide" &&
+      (
+        (
+          isActiveSignal(
+            updateData.carbon_monoxide,
+          ) &&
+          !isActiveSignal(
+            oldDevice.carbon_monoxide,
+          )
+        ) ||
+        (
+          isActiveSignal(updateData.co_alarm) &&
+          !isActiveSignal(oldDevice.co_alarm)
+        )
+      )
+    ) {
+      queueEventAlarm(receiverUid, {
+        ownerUid,
+        homeId,
+        homeName,
+        deviceName,
+        type: deviceType,
+        reason: `${deviceName}: Phát hiện khí CO`,
+        repeatMinutes: 0,
+        nextAlarm: "ngay lập tức",
+      });
+
+      return;
+    }
+
+    if (
       deviceType === "gas" &&
       (
         (
-          updateData.gas === true &&
-          oldDevice.gas !== true
+          isActiveSignal(updateData.gas) &&
+          !isActiveSignal(oldDevice.gas)
         ) ||
         (
-          updateData.gas_alarm === true &&
-          oldDevice.gas_alarm !== true
+          isActiveSignal(updateData.gas_alarm) &&
+          !isActiveSignal(oldDevice.gas_alarm)
         )
       )
     ) {
@@ -2933,16 +3416,16 @@ async function processScheduleAlarmsForOwner(
       ) &&
       (
         (
-          updateData.water_leak === true &&
-          oldDevice.water_leak !== true
+          isActiveSignal(updateData.water_leak) &&
+          !isActiveSignal(oldDevice.water_leak)
         ) ||
         (
-          updateData.leak === true &&
-          oldDevice.leak !== true
+          isActiveSignal(updateData.leak) &&
+          !isActiveSignal(oldDevice.leak)
         ) ||
         (
-          updateData.water === true &&
-          oldDevice.water !== true
+          isActiveSignal(updateData.water) &&
+          !isActiveSignal(oldDevice.water)
         )
       )
     ) {
@@ -3071,20 +3554,23 @@ async function processScheduleAlarmsForOwner(
 
   const motionTriggered =
     (
-      updateData.occupancy === true &&
-      oldDevice.occupancy !== true
+      isActiveSignal(updateData.occupancy) &&
+      !isActiveSignal(oldDevice.occupancy)
     ) ||
     (
-      updateData.motion === true &&
-      oldDevice.motion !== true
+      isActiveSignal(updateData.motion) &&
+      !isActiveSignal(oldDevice.motion)
     ) ||
     (
-      updateData.presence === true &&
-      oldDevice.presence !== true
+      isActiveSignal(updateData.presence) &&
+      !isActiveSignal(oldDevice.presence)
     );
 
   if (
-    deviceType === "motion" &&
+    (
+      deviceType === "motion" ||
+      deviceType === "presence"
+    ) &&
     motionTriggered
   ) {
     rememberScheduleTrigger();
@@ -3096,6 +3582,62 @@ async function processScheduleAlarmsForOwner(
       deviceName,
       type: deviceType,
       reason: `${deviceName}: Phát hiện chuyển động`,
+      repeatMinutes,
+      nextAlarm,
+    });
+
+    return;
+  }
+
+  if (
+    (
+      deviceType === "vibration" ||
+      deviceType === "glass_break"
+    ) &&
+    (
+      isActiveSignal(updateData.vibration) ||
+      updateData.action !== undefined
+    )
+  ) {
+    rememberScheduleTrigger();
+
+    queueEventAlarm(receiverUid, {
+      ownerUid,
+      homeId,
+      homeName,
+      deviceName,
+      type: deviceType,
+      reason:
+        deviceType === "glass_break"
+          ? `${deviceName}: Phát hiện kính vỡ`
+          : `${deviceName}: Phát hiện rung/chấn động`,
+      repeatMinutes,
+      nextAlarm,
+    });
+
+    return;
+  }
+
+  if (
+    (
+      deviceType === "door_lock" ||
+      deviceType === "lock"
+    ) &&
+    normalizeLockState({
+      ...oldDevice,
+      ...updateData,
+    }) === "unlocked" &&
+    normalizeLockState(oldDevice) !== "unlocked"
+  ) {
+    rememberScheduleTrigger();
+
+    queueEventAlarm(receiverUid, {
+      ownerUid,
+      homeId,
+      homeName,
+      deviceName,
+      type: deviceType,
+      reason: `${deviceName}: Khóa đã mở`,
       repeatMinutes,
       nextAlarm,
     });
@@ -3335,9 +3877,316 @@ async function cleanupLegacySecurityScheduleState() {
 }
 
 
+// ================= SECURITY MODE TRANSITION =================
+// Khi một nhà chuyển từ normal -> armed, phải kiểm tra ngay trạng thái
+// hiện tại của toàn bộ sensor. Nhờ vậy cửa/khóa đã mở từ trước vẫn tạo
+// Alarm mà không cần chờ một MQTT event mới.
+const securityModeHomeListenerMap = new Map();
+const securityModeAccountListenerMap = new Map();
+const securityModeLastValueMap = new Map();
+const securityModeTransitionInProgress = new Set();
+
+function getSecurityModeHomeKey(ownerUid, homeId) {
+  return `${ownerUid}|${homeId}`;
+}
+
+function normalizeHomeSecurityMode(value) {
+  return String(value || "").trim() === "armed"
+    ? "armed"
+    : "normal";
+}
+
+function detachSecurityModeHomeListener(ownerUid, homeId) {
+  const key = getSecurityModeHomeKey(ownerUid, homeId);
+  const listener = securityModeHomeListenerMap.get(key);
+
+  if (listener) {
+    listener.ref.off("value", listener.callback);
+    securityModeHomeListenerMap.delete(key);
+  }
+
+  securityModeLastValueMap.delete(key);
+  securityModeTransitionInProgress.delete(key);
+}
+
+async function triggerAlarmForUnsafeStateOnArmed(
+  ownerUid,
+  homeId,
+) {
+  const transitionKey = getSecurityModeHomeKey(
+    ownerUid,
+    homeId,
+  );
+
+  if (securityModeTransitionInProgress.has(transitionKey)) {
+    return;
+  }
+
+  securityModeTransitionInProgress.add(transitionKey);
+
+  try {
+    const [homeSnap, sharedSnap] = await Promise.all([
+      db
+        .ref(`accounts/${ownerUid}/homes/${homeId}`)
+        .once("value"),
+      db
+        .ref(`sharedByHome/${homeId}`)
+        .once("value"),
+    ]);
+
+    const home = homeSnap.val();
+
+    // Mode có thể đã được đổi ngược về normal trong lúc đang đọc dữ liệu.
+    if (
+      !home ||
+      normalizeHomeSecurityMode(home.securityMode) !== "armed"
+    ) {
+      return;
+    }
+
+    const homeName = String(home.name || homeId).trim() || homeId;
+    const devices = asObject(home.devices);
+    const alarmItems = [];
+
+    for (const [deviceId, rawDevice] of Object.entries(devices)) {
+      const device = asObject(rawDevice);
+      const deviceType = String(
+        device.type || "unknown",
+      ).trim();
+
+      if (!isSecurityDeviceType(deviceType)) {
+        continue;
+      }
+
+      const deviceName = String(
+        device.name || deviceId,
+      ).trim() || deviceId;
+
+      const reason = getUnsafeSecurityReason(
+        deviceName,
+        deviceType,
+        device,
+      );
+
+      if (!reason) {
+        continue;
+      }
+
+      alarmItems.push({
+        ownerUid,
+        homeId,
+        homeName,
+        deviceName,
+        type: deviceType,
+        reason,
+        repeatMinutes: 0,
+        nextAlarm: "không lặp lại",
+      });
+    }
+
+    if (alarmItems.length === 0) {
+      console.log(
+        "🛡️ SECURITY MODE ARMED, CURRENT STATE SAFE:",
+        ownerUid,
+        homeId,
+      );
+      return;
+    }
+
+    const receiverUids = new Set([ownerUid]);
+    const sharedMembers = asObject(sharedSnap.val());
+
+    for (const sharedUid of Object.keys(sharedMembers)) {
+      const cleanUid = String(sharedUid || "").trim();
+
+      if (cleanUid) {
+        receiverUids.add(cleanUid);
+      }
+    }
+
+    for (const receiverUid of receiverUids) {
+      await startOrMergeAlarmIncidents(
+        receiverUid,
+        alarmItems,
+      );
+    }
+
+    console.log(
+      "🚨 SECURITY MODE ARMED WITH EXISTING UNSAFE STATE:",
+      ownerUid,
+      homeId,
+      `items=${alarmItems.length}`,
+      `receivers=${receiverUids.size}`,
+    );
+  } catch (error) {
+    console.log(
+      "SECURITY MODE TRANSITION ALARM ERROR:",
+      ownerUid,
+      homeId,
+      error.message,
+    );
+  } finally {
+    securityModeTransitionInProgress.delete(transitionKey);
+  }
+}
+
+function attachSecurityModeHomeListener(ownerUid, homeId) {
+  const key = getSecurityModeHomeKey(ownerUid, homeId);
+
+  if (securityModeHomeListenerMap.has(key)) {
+    return;
+  }
+
+  const modeRef = db.ref(
+    `accounts/${ownerUid}/homes/${homeId}/securityMode`,
+  );
+
+  const callback = (snapshot) => {
+    const nextMode = normalizeHomeSecurityMode(
+      snapshot.val(),
+    );
+
+    if (!securityModeLastValueMap.has(key)) {
+      // Lần đọc đầu chỉ dùng để lấy trạng thái nền, không tạo Alarm
+      // khi backend vừa restart trong lúc nhà đã ở mode Bảo vệ.
+      securityModeLastValueMap.set(key, nextMode);
+      return;
+    }
+
+    const previousMode = securityModeLastValueMap.get(key);
+    securityModeLastValueMap.set(key, nextMode);
+
+    if (
+      previousMode !== "armed" &&
+      nextMode === "armed"
+    ) {
+      void triggerAlarmForUnsafeStateOnArmed(
+        ownerUid,
+        homeId,
+      );
+    }
+  };
+
+  modeRef.on(
+    "value",
+    callback,
+    (error) => {
+      console.log(
+        "SECURITY MODE HOME LISTENER ERROR:",
+        ownerUid,
+        homeId,
+        error.message,
+      );
+    },
+  );
+
+  securityModeHomeListenerMap.set(key, {
+    ref: modeRef,
+    callback,
+  });
+}
+
+function detachSecurityModeAccountListener(ownerUid) {
+  const listener = securityModeAccountListenerMap.get(ownerUid);
+
+  if (listener) {
+    listener.ref.off("child_added", listener.onHomeAdded);
+    listener.ref.off("child_removed", listener.onHomeRemoved);
+    securityModeAccountListenerMap.delete(ownerUid);
+  }
+
+  for (const key of Array.from(securityModeHomeListenerMap.keys())) {
+    if (!key.startsWith(`${ownerUid}|`)) {
+      continue;
+    }
+
+    const homeId = key.slice(ownerUid.length + 1);
+    detachSecurityModeHomeListener(ownerUid, homeId);
+  }
+}
+
+function attachSecurityModeAccountListener(ownerUid) {
+  if (securityModeAccountListenerMap.has(ownerUid)) {
+    return;
+  }
+
+  const homesRef = db.ref(`accounts/${ownerUid}/homes`);
+
+  const onHomeAdded = (homeSnapshot) => {
+    const homeId = String(homeSnapshot.key || "").trim();
+
+    if (homeId) {
+      attachSecurityModeHomeListener(ownerUid, homeId);
+    }
+  };
+
+  const onHomeRemoved = (homeSnapshot) => {
+    const homeId = String(homeSnapshot.key || "").trim();
+
+    if (homeId) {
+      detachSecurityModeHomeListener(ownerUid, homeId);
+    }
+  };
+
+  homesRef.on("child_added", onHomeAdded);
+  homesRef.on("child_removed", onHomeRemoved);
+
+  securityModeAccountListenerMap.set(ownerUid, {
+    ref: homesRef,
+    onHomeAdded,
+    onHomeRemoved,
+  });
+}
+
+async function startSecurityModeTransitionMonitor() {
+  const accountsRef = db.ref("accounts");
+
+  // Chụp trạng thái nền trước khi Auto Away bắt đầu chạy. Nhờ đó lần
+  // normal -> armed đầu tiên sau khi backend khởi động không bị bỏ lỡ.
+  const accountsSnap = await accountsRef.once("value");
+  const accounts = asObject(accountsSnap.val());
+
+  for (const [ownerUid, rawAccount] of Object.entries(accounts)) {
+    const homes = asObject(rawAccount?.homes);
+
+    for (const [homeId, rawHome] of Object.entries(homes)) {
+      const key = getSecurityModeHomeKey(ownerUid, homeId);
+      const home = asObject(rawHome);
+
+      securityModeLastValueMap.set(
+        key,
+        normalizeHomeSecurityMode(home.securityMode),
+      );
+    }
+
+    attachSecurityModeAccountListener(ownerUid);
+  }
+
+  accountsRef.on("child_added", (accountSnapshot) => {
+    const ownerUid = String(accountSnapshot.key || "").trim();
+
+    if (ownerUid) {
+      attachSecurityModeAccountListener(ownerUid);
+    }
+  });
+
+  accountsRef.on("child_removed", (accountSnapshot) => {
+    const ownerUid = String(accountSnapshot.key || "").trim();
+
+    if (ownerUid) {
+      detachSecurityModeAccountListener(ownerUid);
+    }
+  });
+
+  console.log(
+    "🛡️ SECURITY MODE TRANSITION MONITOR STARTED:",
+    `homes=${securityModeLastValueMap.size}`,
+  );
+}
+
 // ================= AUTO AWAY =================
-const AUTO_AWAY_ARM_DELAY_MS = 2 * 60 * 1000;
-const AUTO_AWAY_SCAN_INTERVAL_MS = 30 * 1000;
+const AUTO_AWAY_ARM_DELAY_MS = 30 * 1000;
+const AUTO_AWAY_SCAN_INTERVAL_MS = 10 * 1000;
 
 let autoAwayTimer = null;
 let autoAwayScanRunning = false;
@@ -3417,6 +4266,34 @@ function buildRuntime({
   };
 }
 
+
+function presenceSummarySignature(summary) {
+  const value = asObject(summary);
+
+  return JSON.stringify({
+    memberCount: Number(value.memberCount || 0),
+    insideCount: Number(value.insideCount || 0),
+    outsideCount: Number(value.outsideCount || 0),
+    unknownCount: Number(value.unknownCount || 0),
+  });
+}
+
+function buildPresenceSummary({
+  memberCount,
+  insideCount,
+  outsideCount,
+  unknownCount,
+  now,
+}) {
+  return {
+    memberCount,
+    insideCount,
+    outsideCount,
+    unknownCount,
+    updatedAt: now,
+  };
+}
+
 async function checkAutoAwayHomes(db) {
   if (autoAwayScanRunning) {
     return;
@@ -3450,26 +4327,8 @@ async function checkAutoAwayHomes(db) {
           `accounts/${ownerUid}/homes/${homeId}`;
         const runtimePath =
           `${homePath}/autoAwayRuntime`;
-
-        if (autoAway.enabled !== true) {
-          if (Object.keys(runtime).length > 0) {
-            updates[runtimePath] = null;
-          }
-
-          if (
-            home.securityMode === "armed" &&
-            home.securityModeSource === "auto_away"
-          ) {
-            updates[`${homePath}/securityMode`] = "normal";
-            updates[`${homePath}/securityModeSource`] = null;
-
-            logs.push(
-              `🏠 AUTO AWAY OFF → NORMAL: ${ownerUid} ${homeId}`,
-            );
-          }
-
-          continue;
-        }
+        const presenceSummaryPath =
+          `${homePath}/presenceSummary`;
 
         const members = new Set([ownerUid]);
         const sharedMembers = asObject(sharedByHome[homeId]);
@@ -3500,7 +4359,48 @@ async function checkAutoAwayHomes(db) {
         const outsideCount = states.filter(
           (state) => state === "outside",
         ).length;
-        const unknownCount = memberCount - insideCount - outsideCount;
+        const unknownCount =
+          memberCount - insideCount - outsideCount;
+
+        const currentPresenceSummary =
+          asObject(home.presenceSummary);
+
+        const nextPresenceSummary =
+          buildPresenceSummary({
+            memberCount,
+            insideCount,
+            outsideCount,
+            unknownCount,
+            now,
+          });
+
+        if (
+          presenceSummarySignature(currentPresenceSummary) !==
+          presenceSummarySignature(nextPresenceSummary)
+        ) {
+          updates[presenceSummaryPath] =
+            nextPresenceSummary;
+        }
+
+        if (autoAway.enabled !== true) {
+          if (Object.keys(runtime).length > 0) {
+            updates[runtimePath] = null;
+          }
+
+          if (
+            home.securityMode === "armed" &&
+            home.securityModeSource === "auto_away"
+          ) {
+            updates[`${homePath}/securityMode`] = "normal";
+            updates[`${homePath}/securityModeSource`] = null;
+
+            logs.push(
+              `🏠 AUTO AWAY OFF → NORMAL: ${ownerUid} ${homeId}`,
+            );
+          }
+
+          continue;
+        }
 
         const anyInside = insideCount > 0;
         const allOutside =
@@ -3781,6 +4681,9 @@ async function init() {
 
   // Khôi phục các sự cố Alarm chưa được xử lý sau khi backend restart.
   await resumeActiveAlarmIncidents();
+
+  // Khi mode chuyển normal -> armed, kiểm tra ngay trạng thái sensor hiện tại.
+  await startSecurityModeTransitionMonitor();
 
   // Tự động chuyển Mode khi toàn bộ thành viên rời nhà.
   startAutoAwayMonitor({ db });
@@ -5878,8 +6781,54 @@ client.on("message", async (topic, msg) => {
             defaultName = `Cửa ${sameTypeCount}`;
             break;
 
+          case "window":
+            defaultName = `Cửa sổ ${sameTypeCount}`;
+            break;
+
+          case "gate":
+            defaultName = `Cổng ${sameTypeCount}`;
+            break;
+
+          case "door_lock":
+          case "lock":
+            defaultName = `Khóa thông minh ${sameTypeCount}`;
+            break;
+
+          case "motion":
+            defaultName = `Cảm biến chuyển động ${sameTypeCount}`;
+            break;
+
+          case "presence":
+            defaultName = `Cảm biến hiện diện ${sameTypeCount}`;
+            break;
+
+          case "vibration":
+            defaultName = `Cảm biến rung ${sameTypeCount}`;
+            break;
+
+          case "glass_break":
+            defaultName = `Cảm biến kính vỡ ${sameTypeCount}`;
+            break;
+
           case "smoke":
             defaultName = `Báo cháy ${sameTypeCount}`;
+            break;
+
+          case "heat":
+            defaultName = `Cảm biến nhiệt nguy hiểm ${sameTypeCount}`;
+            break;
+
+          case "carbon_monoxide":
+            defaultName = `Cảm biến khí CO ${sameTypeCount}`;
+            break;
+
+          case "gas":
+            defaultName = `Cảm biến gas ${sameTypeCount}`;
+            break;
+
+          case "water_leak":
+          case "flood":
+            defaultName = `Cảm biến ngập nước ${sameTypeCount}`;
             break;
 
           case "temperature":
@@ -5890,12 +6839,44 @@ client.on("message", async (topic, msg) => {
             defaultName = `SOS ${sameTypeCount}`;
             break;
 
+          case "smart_plug":
+            defaultName = `Ổ điện thông minh ${sameTypeCount}`;
+            break;
+
+          case "power_monitor":
+            defaultName = `Đo điện năng ${sameTypeCount}`;
+            break;
+
+          case "ups":
+            defaultName = `Nguồn dự phòng ${sameTypeCount}`;
+            break;
+
+          case "siren":
+            defaultName = `Còi báo động ${sameTypeCount}`;
+            break;
+
+          case "smart_valve":
+            defaultName = `Van thông minh ${sameTypeCount}`;
+            break;
+
+          case "camera":
+            defaultName = `Camera ${sameTypeCount}`;
+            break;
+
+          case "doorbell":
+            defaultName = `Chuông cửa ${sameTypeCount}`;
+            break;
+
+          case "keypad":
+            defaultName = `Bàn phím an ninh ${sameTypeCount}`;
+            break;
+
           case "repeater":
             defaultName = `Bộ mở rộng sóng ${sameTypeCount}`;
             break;
 
           default:
-            defaultName = `Thiết bị ${sameTypeCount}`;
+            defaultName = `Thiết bị chưa nhận diện ${sameTypeCount}`;
         }
         await db.ref(`accounts/${uid}/homes/${homeId}/devices/${ieee}`).set({
           name: defaultName,
@@ -5903,7 +6884,7 @@ client.on("message", async (topic, msg) => {
           type: deviceType,
           roomId: roomId || "unassigned",
           alarm:
-            deviceType === "door"
+            isSecurityDeviceType(deviceType)
               ? {
                 enabled: true,
                 start: "23:00",
@@ -6038,69 +7019,133 @@ client.on("message", async (topic, msg) => {
 
     const now = Date.now();
 
-    let updateData = {};
-    updateData.updated_at = now;
-    if (data.availability !== undefined) {
-      updateData.availability = data.availability;
+    const currentDeviceType = String(
+      oldData.type || "unknown",
+    ).trim();
+
+    const inferredDeviceType =
+      inferDeviceTypeFromPayload(
+        data,
+        currentDeviceType,
+      );
+
+    let updateData = {
+      updated_at: now,
+    };
+
+    if (
+      currentDeviceType === "unknown" &&
+      inferredDeviceType !== "unknown"
+    ) {
+      updateData.type = inferredDeviceType;
     }
 
-    if (data.last_seen !== undefined) {
-      updateData.last_seen = data.last_seen;
-    }
-    if (data.linkquality !== undefined) {
-      updateData.linkquality = data.linkquality;
-    }
-    if (data.contact !== undefined) {
-      updateData.contact = data.contact;
+    const fieldsToCopy = [
+      "availability",
+      "last_seen",
+      "linkquality",
+      "contact",
+      "tamper",
+      "battery",
+      "battery_low",
+      "smoke",
+      "temperature",
+      "humidity",
+      "action",
+      "occupancy",
+      "motion",
+      "presence",
+      "vibration",
+      "vibration_strength",
+      "angle",
+      "x_axis",
+      "y_axis",
+      "z_axis",
+      "gas",
+      "gas_alarm",
+      "carbon_monoxide",
+      "co_alarm",
+      "water_leak",
+      "leak",
+      "water",
+      "heat",
+      "heat_alarm",
+      "high_temperature_alarm",
+      "lock",
+      "lock_state",
+      "state",
+      "power",
+      "current",
+      "voltage",
+      "energy",
+      "consumption",
+      "device_temperature",
+      "switch_type",
+    ];
 
-      if (data.contact !== oldData.contact) {
-        updateData.last_event = now;
+    for (const field of fieldsToCopy) {
+      if (data[field] !== undefined) {
+        updateData[field] = data[field];
       }
     }
 
-    if (data.tamper !== undefined) {
-      const newTamper = data.tamper;
-      updateData.tamper = newTamper;
+    const eventFields = [
+      "contact",
+      "tamper",
+      "smoke",
+      "action",
+      "occupancy",
+      "motion",
+      "presence",
+      "vibration",
+      "gas",
+      "gas_alarm",
+      "carbon_monoxide",
+      "co_alarm",
+      "water_leak",
+      "leak",
+      "water",
+      "heat",
+      "heat_alarm",
+      "high_temperature_alarm",
+      "lock",
+      "lock_state",
+      "state",
+    ];
 
-      if (newTamper !== oldTamper) {
-        updateData.last_event = now;
-      }
+    if (
+      eventFields.some((field) => {
+        return (
+          data[field] !== undefined &&
+          data[field] !== oldData[field]
+        );
+      })
+    ) {
+      updateData.last_event = now;
     }
 
     if (data.battery !== undefined) {
-      updateData.battery = data.battery;
       updateData.battery_status = "percent";
     }
 
     if (data.battery_low !== undefined) {
-      updateData.battery_low = data.battery_low;
-      updateData.battery_status = data.battery_low === true ? "low" : "ok";
-    }
-    if (data.smoke !== undefined) {
-      updateData.type = "smoke";
-      updateData.smoke = data.smoke;
-
-      if (data.smoke !== oldData.smoke) {
-        updateData.last_event = now;
-      }
+      updateData.battery_status =
+        data.battery_low === true ? "low" : "ok";
     }
 
-    if (data.temperature !== undefined) {
-      updateData.type = "temperature";
-      updateData.temperature = data.temperature;
-    }
+    const resolvedDeviceType =
+      updateData.type ||
+      currentDeviceType ||
+      inferredDeviceType ||
+      "unknown";
 
-    if (data.humidity !== undefined) {
-      updateData.type = "temperature";
-      updateData.humidity = data.humidity;
-    }
-
-    if (data.action !== undefined) {
-      updateData.type = "sos";
-      updateData.action = data.action;
-      updateData.last_event = now;
+    if (
+      resolvedDeviceType === "sos" &&
+      data.action !== undefined
+    ) {
       updateData.last_triggered = now;
-      updateData.sos_active_until = now + 5 * 60 * 1000;
+      updateData.sos_active_until =
+        now + 5 * 60 * 1000;
     }
 
 
@@ -6112,14 +7157,56 @@ client.on("message", async (topic, msg) => {
 
       const currentType = updateData.type || oldData.type || "door";
 
-      if (currentType === "door") {
-        statusText = updateData.contact === false ? "Cửa mở" : "Cửa đóng";
+      if (
+        currentType === "door" ||
+        currentType === "window" ||
+        currentType === "gate"
+      ) {
+        statusText =
+          updateData.contact === false
+            ? "Cửa mở"
+            : "Cửa đóng";
+      } else if (
+        currentType === "door_lock" ||
+        currentType === "lock"
+      ) {
+        statusText =
+          normalizeLockState({
+            ...oldData,
+            ...updateData,
+          }) === "unlocked"
+            ? "Khóa đã mở"
+            : "Khóa đã đóng";
+      } else if (
+        currentType === "motion" ||
+        currentType === "presence"
+      ) {
+        statusText = "Phát hiện chuyển động";
+      } else if (currentType === "vibration") {
+        statusText = "Phát hiện rung/chấn động";
+      } else if (currentType === "glass_break") {
+        statusText = "Phát hiện kính vỡ";
       } else if (currentType === "smoke") {
-        statusText = updateData.smoke === true ? "Phát hiện khói" : "Khói đã trở lại bình thường";
+        statusText = isActiveSignal(updateData.smoke)
+          ? "Phát hiện khói"
+          : "Khói đã trở lại bình thường";
+      } else if (currentType === "heat") {
+        statusText = "Cập nhật cảnh báo nhiệt";
+      } else if (currentType === "carbon_monoxide") {
+        statusText = "Cập nhật cảm biến khí CO";
+      } else if (currentType === "gas") {
+        statusText = "Cập nhật cảm biến gas";
+      } else if (
+        currentType === "water_leak" ||
+        currentType === "flood"
+      ) {
+        statusText = "Cập nhật cảm biến ngập nước";
       } else if (currentType === "sos") {
         statusText = "Nút SOS đã được bấm";
       } else if (currentType === "temperature") {
         statusText = "Cập nhật nhiệt độ / độ ẩm";
+      } else if (currentType === "smart_plug") {
+        statusText = "Ổ điện thông minh đã cập nhật";
       } else if (currentType === "repeater") {
         statusText = "Bộ mở rộng sóng đã cập nhật trạng thái";
       } else {
