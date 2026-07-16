@@ -3,6 +3,12 @@ const fs = require("fs");
 const mqtt = require("mqtt");
 const admin = require("firebase-admin");
 const crypto = require("crypto");
+const path = require("path");
+const {
+  normalizeLanguageCode,
+  localizeBackendText,
+  localizeAlarmItemsJson,
+} = require("./backend_localizations");
 
 const lastHeartbeatMap = {};
 const lastAlarmMap = {};
@@ -12,6 +18,68 @@ const pendingEventAlarmMap = {};
 const pendingEventAlarmTimerMap = {};
 const pendingScheduleReminderMap = {};
 const pendingScheduleReminderTimerMap = {};
+
+// ================= OFFLINE-FIRST RUNTIME =================
+// Lưu snapshot cấu hình và hàng đợi sự cố ngay cạnh backend để Hub vẫn
+// quyết định Alarm/còi khi Internet hoặc Firebase tạm thời mất kết nối.
+const LOCAL_RUNTIME_DIR = process.env.SAFEHOME_RUNTIME_DIR ||
+  path.join(__dirname, ".safehome_runtime");
+const LOCAL_RUNTIME_SNAPSHOT_FILE = path.join(
+  LOCAL_RUNTIME_DIR,
+  "firebase_snapshot.json",
+);
+const LOCAL_OFFLINE_QUEUE_FILE = path.join(
+  LOCAL_RUNTIME_DIR,
+  "offline_queue.json",
+);
+const LOCAL_RUNTIME_SNAPSHOT_VERSION = 1;
+const OFFLINE_QUEUE_MAX_ITEMS = 1000;
+const OFFLINE_QUEUE_FLUSH_INTERVAL_MS = 15 * 1000;
+const LOCAL_RUNTIME_SNAPSHOT_SAVE_DELAY_MS = 10 * 1000;
+const OFFLINE_TRANSIENT_ALARM_TTL_MS = 5 * 60 * 1000;
+const offlineOperationQueue = [];
+const offlineAlarmDemandMap = new Map();
+const offlineAlarmSirenTimerMap = new Map();
+const offlineAlarmExpiryTimerMap = new Map();
+let firebaseConnected = false;
+let localRuntimeSnapshotSaveTimer = null;
+let offlineQueueSaveTimer = null;
+let offlineQueueFlushTimer = null;
+let offlineQueueFlushInProgress = false;
+let firebaseConnectionMonitorStarted = false;
+
+// ================= CO SENSOR FIREBASE THROTTLE =================
+// Một số cảm biến CO Tuya gửi MQTT gần như liên tục. Trạng thái nguy hiểm
+// vẫn phải được ghi/xử lý ngay, còn ppm và telemetry được giới hạn để tránh
+// đọc/ghi Firebase hàng trăm nghìn lần mỗi ngày.
+const CO_VALUE_PERSIST_INTERVAL_MS = 30 * 1000;
+const CO_TELEMETRY_PERSIST_INTERVAL_MS = 60 * 1000;
+const coSensorRuntimeMap = new Map();
+const coSensorProcessingPromiseMap = new Map();
+const vibrationStateClearTimerMap = new Map();
+
+// ================= PHYSICAL HOME SIREN =================
+// Còi vật lý là actuator cấp Home, không tự tạo incident. Security chỉ bật
+// ở cấp "siren"; Emergency bật ở cấp "fullscreen_siren". Lệnh có thời hạn
+// 30 phút để còi tự dừng an toàn nếu backend mất kết nối, sau đó backend sẽ
+// làm mới định kỳ khi sự cố vẫn còn active.
+const HOME_SIREN_DEFAULT_VOLUME = "high";
+const HOME_SIREN_DEFAULT_MELODY = "1";
+const HOME_SIREN_COMMAND_DURATION_SEC = 30 * 60;
+const HOME_SIREN_REFRESH_INTERVAL_MS = 20 * 60 * 1000;
+const HOME_SIREN_RECONCILE_INTERVAL_MS = 15 * 1000;
+const HOME_SIREN_STOP_MAX_ATTEMPTS = 3;
+const HOME_SIREN_STOP_CONFIRM_WAIT_MS = 1200;
+const HOME_SIREN_STOP_RETRY_DELAY_MS = 350;
+const HOME_SIREN_ACTION_RESULT_TTL_MS = 30 * 1000;
+const VIBRATION_ACTIVE_WINDOW_MS = 15 * 1000;
+const homeSirenRuntimeMap = new Map();
+// Ghi nhớ trạng thái tắt còi chủ động ngay trong runtime để vòng reconcile
+// 15 giây không bật lại còi trước khi accountCache nhận bản ghi Firebase mới.
+// Giá trị null là tombstone: Home hiện không còn mute chủ động.
+const homeSirenManualMuteRuntimeMap = new Map();
+let homeSirenReconcileTimer = null;
+
 const userDirectoryCache = {};
 const processedChatNotificationMessages = new Set();
 let chatUnreadMigrationPromise = null;
@@ -57,19 +125,40 @@ const ALARM_INCIDENT_WATCHDOG_INTERVAL_MS = 60 * 1000;
 const ALARM_STAGE_RETRY_DELAY_MS = 15 * 1000;
 const ALARM_STAGE_MAX_RETRY_COUNT = 4;
 
-// Hub ghi heartbeat lên Firebase mỗi 30 giây.
-// App sẽ coi hub Offline khi lastHeartbeatAt quá 90 giây.
+// Hub ghi heartbeat lên Firebase mỗi 60 giây.
+// Backend và app chỉ coi Hub Offline khi quá 180 giây để chịu được
+// một chu kỳ ghi chậm mà không tạo cảnh báo giả.
 const HUB_HEARTBEAT_INTERVAL_MS = 60 * 1000;
 const HUB_HEARTBEAT_STARTED_AT = Date.now();
+
+// ================= SYSTEM HEALTH =================
+// Pin yếu, cảm biến/Hub/MQTT mất kết nối chỉ là system_warning.
+// Nhóm này không bao giờ tạo Alarm incident, fullscreen hoặc bật còi.
+const SYSTEM_HEALTH_CHECK_INTERVAL_MS = 60 * 1000;
+const SYSTEM_HEALTH_HUB_TIMEOUT_MS = 180 * 1000;
+const SYSTEM_HEALTH_HUB_STARTUP_GRACE_MS = 90 * 1000;
+const SYSTEM_HEALTH_NO_DATA_GRACE_MS = 10 * 60 * 1000;
+const SYSTEM_HEALTH_STARTED_AT = Date.now();
+const systemHealthRuntimeSignatureMap = new Map();
+let systemHealthMonitorTimer = null;
+let systemHealthCheckInProgress = false;
 
 const alarmIncidentTimerMap = {};
 const alarmIncidentAdvanceInProgress = new Set();
 const alarmIncidentActionInProgress = new Set();
+const homeSirenActionInProgress = new Set();
 const alarmIncidentValidationPromiseMap = new Map();
 const alarmIncidentStartPromiseMap = new Map();
 const alarmIncidentQueuedStageMap = new Map();
 const alarmIncidentStageRetryCountMap = new Map();
 const localActiveAlarmIncidentMap = new Map();
+const securityModeRepeatInProgress = new Set();
+// Chặn các packet MQTT trùng/đến song song trước khi chúng kịp tạo hoặc
+// cập nhật incident. Map này chỉ tồn tại trong runtime và không thay đổi
+// trạng thái thật của cảm biến trong Firebase.
+const sensorAlarmEventDebounceMap = new Map();
+const SENSOR_ALARM_DEBOUNCE_MAX_AGE_MS = 5 * 60 * 1000;
+const SENSOR_ALARM_DEBOUNCE_MAX_ENTRIES = 5000;
 let alarmIncidentWatchdogTimer = null;
 function getPiSerial() {
   try {
@@ -427,49 +516,297 @@ function getHomeSafety(home) {
 function getHeartbeatLimitMs(type) {
   if (type === "temperature") return 2 * 60 * 60 * 1000;
   if (type === "repeater") return 1 * 60 * 60 * 1000;
+  if (type === "siren") return 1 * 60 * 60 * 1000;
   if (type === "smoke") return 24 * 60 * 60 * 1000;
   if (type === "sos") return 6 * 60 * 60 * 1000;
 
   return 6 * 60 * 60 * 1000;
 }
 
+function parseSystemHealthTimestamp(value) {
+  if (value === null || value === undefined || value === "") {
+    return 0;
+  }
+
+  const numeric = Number(value);
+
+  if (Number.isFinite(numeric) && numeric > 0) {
+    return numeric;
+  }
+
+  const parsed = new Date(value).getTime();
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+}
+
+function normalizeSystemHealthAvailability(value) {
+  const raw =
+    value && typeof value === "object"
+      ? value.state ?? value.status ?? value.value
+      : value;
+
+  return String(raw || "")
+    .trim()
+    .toLowerCase();
+}
+
+function isSystemHealthExplicitlyOffline(value) {
+  const availability = normalizeSystemHealthAvailability(value);
+
+  return (
+    availability === "offline" ||
+    availability === "unavailable" ||
+    availability === "disconnected" ||
+    availability === "not_available"
+  );
+}
+
+function isSystemHealthExplicitlyOnline(value) {
+  const availability = normalizeSystemHealthAvailability(value);
+
+  return (
+    availability === "online" ||
+    availability === "available" ||
+    availability === "connected"
+  );
+}
+
+function isProtectionRelevantDeviceType(type) {
+  return (
+    isSecurityDeviceType(type) ||
+    isEmergencyDeviceType(type) ||
+    type === "siren" ||
+    type === "repeater" ||
+    type === "ups"
+  );
+}
+
+function evaluateDeviceSystemHealth(
+  deviceId,
+  rawDevice,
+  now = Date.now(),
+) {
+  const device = rawDevice || {};
+  const type = String(device.type || "unknown")
+    .trim()
+    .toLowerCase();
+  const deviceName = String(device.name || deviceId).trim() || deviceId;
+  const issues = [];
+  const availability = device.availability;
+  const lastSeen = parseSystemHealthTimestamp(device.last_seen);
+  const heartbeatLimitMs = getHeartbeatLimitMs(type);
+
+  let offline = isSystemHealthExplicitlyOffline(availability);
+
+  if (!offline && lastSeen > 0) {
+    offline = now - lastSeen > heartbeatLimitMs * 1.3;
+  }
+
+  if (
+    !offline &&
+    lastSeen <= 0 &&
+    !isSystemHealthExplicitlyOnline(availability) &&
+    now - SYSTEM_HEALTH_STARTED_AT >= SYSTEM_HEALTH_NO_DATA_GRACE_MS
+  ) {
+    offline = true;
+  }
+
+  if (offline) {
+    issues.push({
+      code: "device_offline",
+      level: "warning",
+      entityType: "device",
+      entityId: deviceId,
+      deviceId,
+      deviceName,
+      deviceType: type,
+      message: `${deviceName}: mất kết nối`,
+      protectionRelevant: isProtectionRelevantDeviceType(type),
+    });
+  }
+
+  const batteryValue = Number(device.battery);
+  const batteryLow =
+    device.battery_low === true ||
+    (
+      Number.isFinite(batteryValue) &&
+      batteryValue >= 0 &&
+      batteryValue <= 20
+    );
+
+  if (batteryLow) {
+    issues.push({
+      code: "device_low_battery",
+      level: "warning",
+      entityType: "device",
+      entityId: deviceId,
+      deviceId,
+      deviceName,
+      deviceType: type,
+      battery: Number.isFinite(batteryValue)
+        ? batteryValue
+        : null,
+      message: `${deviceName}: pin yếu`,
+      protectionRelevant: isProtectionRelevantDeviceType(type),
+    });
+  }
+
+  return issues;
+}
+
+function evaluateHomeSystemHealth(rawHome, now = Date.now()) {
+  const home = rawHome || {};
+  const issues = [];
+  const hubId = String(home.hubId || "").trim();
+  const hubStatus =
+    home.hubStatus && typeof home.hubStatus === "object"
+      ? home.hubStatus
+      : {};
+  const hubHeartbeatAt = parseSystemHealthTimestamp(
+    hubStatus.lastHeartbeatAt,
+  );
+
+  let hubTracked = hubId.length > 0;
+  let hubOnline = true;
+  let mqttOnline = true;
+
+  if (hubTracked) {
+    const inStartupGrace =
+      now - SYSTEM_HEALTH_STARTED_AT <
+      SYSTEM_HEALTH_HUB_STARTUP_GRACE_MS;
+
+    const heartbeatMissingOrStale =
+      hubHeartbeatAt <= 0 ||
+      now - hubHeartbeatAt > SYSTEM_HEALTH_HUB_TIMEOUT_MS;
+
+    if (!inStartupGrace && heartbeatMissingOrStale) {
+      hubOnline = false;
+      mqttOnline = false;
+      issues.push({
+        code: "hub_offline",
+        level: "warning",
+        entityType: "hub",
+        entityId: hubId,
+        hubId,
+        message: "Hub mất kết nối",
+        protectionRelevant: true,
+      });
+    } else if (
+      !heartbeatMissingOrStale &&
+      hubStatus.mqttConnected === false
+    ) {
+      mqttOnline = false;
+      issues.push({
+        code: "mqtt_offline",
+        level: "warning",
+        entityType: "hub",
+        entityId: hubId,
+        hubId,
+        message: "MQTT mất kết nối",
+        protectionRelevant: true,
+      });
+    }
+  }
+
+  const devices =
+    home.devices && typeof home.devices === "object"
+      ? home.devices
+      : {};
+
+  for (const [deviceId, device] of Object.entries(devices)) {
+    issues.push(
+      ...evaluateDeviceSystemHealth(deviceId, device, now),
+    );
+  }
+
+  issues.sort((first, second) => {
+    return `${first.code}|${first.entityId}`.localeCompare(
+      `${second.code}|${second.entityId}`,
+    );
+  });
+
+  const protectionComplete = !issues.some(
+    (issue) => issue.protectionRelevant === true,
+  );
+  const issueSignature = issues
+    .map((issue) => `${issue.code}:${issue.entityId}`)
+    .join("|");
+  const status = issues.length > 0 ? "warning" : "ok";
+
+  return {
+    status,
+    eventCategory: "system_warning",
+    alarmLevel: status === "warning" ? "warning" : "info",
+    protectionComplete,
+    warningCount: issues.length,
+    hubTracked,
+    hubOnline,
+    mqttOnline,
+    issues,
+    issueSignature,
+  };
+}
+
 function getHomeNotificationSafety(home) {
   const devices = home.devices || {};
   const unsafeDevices = [];
+  const dangerIssues = [];
+  const systemWarnings = [];
+  const systemHealth = evaluateHomeSystemHealth(home);
+
+  for (const issue of systemHealth.issues) {
+    if (issue.message) {
+      systemWarnings.push(issue.message);
+    }
+  }
 
   for (const [deviceId, device] of Object.entries(devices)) {
     const name = device.name || deviceId;
     const type = device.type || "door";
     const issues = [];
 
-    const lastSeen = device.last_seen
-      ? new Date(device.last_seen).getTime()
-      : 0;
-
-    const limitMs = getHeartbeatLimitMs(type);
-    const offline =
-      !lastSeen || Date.now() - lastSeen > limitMs * 1.3;
-
-    if (offline) issues.push("mất kết nối");
-
-    const batteryLow =
-      device.battery_low === true ||
-      (
-        device.battery !== undefined &&
-        device.battery !== null &&
-        Number(device.battery) <= 20
-      );
-
-    if (batteryLow) issues.push("pin yếu");
-
-    if (type === "door") {
+    if (type === "door" || type === "window" || type === "gate") {
       if (device.contact === false) issues.push("đang mở");
+      if (device.tamper === true) issues.push("bị tháo");
+    }
+
+    if (type === "door_lock" || type === "lock") {
+      if (normalizeLockState(device) === "unlocked") {
+        issues.push("khóa đang mở");
+      }
       if (device.tamper === true) issues.push("bị tháo");
     }
 
     if (type === "smoke") {
       if (device.smoke === true) issues.push("phát hiện khói");
       if (device.tamper === true) issues.push("bị tháo");
+    }
+
+    if (type === "carbon_monoxide") {
+      if (
+        isActiveSignal(device.carbon_monoxide) ||
+        isActiveSignal(device.co_alarm)
+      ) {
+        issues.push("phát hiện khí CO");
+      }
+    }
+
+    if (type === "gas") {
+      if (
+        isActiveSignal(device.gas) ||
+        isActiveSignal(device.gas_alarm)
+      ) {
+        issues.push("rò rỉ gas");
+      }
+    }
+
+    if (type === "water_leak" || type === "flood") {
+      if (
+        isActiveSignal(device.water_leak) ||
+        isActiveSignal(device.leak) ||
+        isActiveSignal(device.water)
+      ) {
+        issues.push("phát hiện ngập nước");
+      }
     }
 
     if (type === "sos") {
@@ -481,15 +818,117 @@ function getHomeNotificationSafety(home) {
     }
 
     if (issues.length > 0) {
-      unsafeDevices.push(`${name}: ${issues.join(", ")}`);
+      const detail = `${name}: ${issues.join(", ")}`;
+      dangerIssues.push(detail);
+      unsafeDevices.push(detail);
+    }
+  }
+
+  for (const warning of systemWarnings) {
+    if (!unsafeDevices.includes(warning)) {
+      unsafeDevices.push(warning);
     }
   }
 
   return {
-    safe: unsafeDevices.length === 0,
+    safe: dangerIssues.length === 0 && systemWarnings.length === 0,
+    protectionComplete: systemHealth.protectionComplete,
+    dangerIssues,
+    systemWarnings,
     unsafeDevices,
   };
 }
+
+function getSystemHealthRuntimeKey(ownerUid, homeId) {
+  return `${ownerUid}|${homeId}`;
+}
+
+async function checkSystemHealth() {
+  if (!firebaseConnected || systemHealthCheckInProgress) {
+    return;
+  }
+
+  systemHealthCheckInProgress = true;
+
+  try {
+    const now = Date.now();
+    const updates = {};
+    let changedHomes = 0;
+
+    for (const [ownerUid, account] of accountCache.entries()) {
+      const homes = account?.homes || {};
+
+      for (const [homeId, rawHome] of Object.entries(homes)) {
+        const home = rawHome || {};
+        const health = evaluateHomeSystemHealth(home, now);
+        const runtimeKey = getSystemHealthRuntimeKey(ownerUid, homeId);
+        const signature = [
+          health.status,
+          health.protectionComplete ? "complete" : "incomplete",
+          health.issueSignature,
+        ].join("|");
+        const current =
+          home.systemHealth && typeof home.systemHealth === "object"
+            ? home.systemHealth
+            : {};
+        const currentSignature = [
+          String(current.status || ""),
+          current.protectionComplete === true
+            ? "complete"
+            : "incomplete",
+          String(current.issueSignature || ""),
+        ].join("|");
+
+        if (
+          systemHealthRuntimeSignatureMap.get(runtimeKey) === signature ||
+          currentSignature === signature
+        ) {
+          systemHealthRuntimeSignatureMap.set(runtimeKey, signature);
+          continue;
+        }
+
+        systemHealthRuntimeSignatureMap.set(runtimeKey, signature);
+        updates[
+          `accounts/${ownerUid}/homes/${homeId}/systemHealth`
+        ] = {
+          ...health,
+          evaluatedAt: now,
+        };
+        changedHomes++;
+      }
+    }
+
+    if (changedHomes > 0) {
+      await db.ref().update(updates);
+      console.log(
+        "🩺 SYSTEM HEALTH UPDATED:",
+        `homes=${changedHomes}`,
+      );
+    }
+  } catch (error) {
+    console.log("SYSTEM HEALTH CHECK ERROR:", error.message);
+  } finally {
+    systemHealthCheckInProgress = false;
+  }
+}
+
+function startSystemHealthMonitor() {
+  if (systemHealthMonitorTimer) {
+    return;
+  }
+
+  void checkSystemHealth();
+
+  systemHealthMonitorTimer = setInterval(() => {
+    void checkSystemHealth();
+  }, SYSTEM_HEALTH_CHECK_INTERVAL_MS);
+
+  console.log(
+    "🩺 SYSTEM HEALTH MONITOR STARTED:",
+    `interval=${SYSTEM_HEALTH_CHECK_INTERVAL_MS / 1000}s`,
+  );
+}
+
 function includesAny(text, keywords) {
   return keywords.some((keyword) => {
     return text.includes(keyword);
@@ -518,6 +957,97 @@ function isActiveSignal(value) {
     normalized === "open" ||
     normalized === "unlocked"
   );
+}
+
+function normalizeDeviceAction(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase();
+}
+
+function isVibrationAction(value) {
+  const action = normalizeDeviceAction(value);
+
+  return (
+    action === "vibration" ||
+    action === "shock" ||
+    action === "tilt" ||
+    action === "drop" ||
+    action === "vibrate" ||
+    action === "vibration_detected"
+  );
+}
+
+function isGlassBreakAction(value) {
+  const action = normalizeDeviceAction(value);
+
+  return (
+    action === "glass_break" ||
+    action === "glass_broken" ||
+    action === "broken_glass"
+  );
+}
+
+function waitMs(durationMs) {
+  return new Promise((resolve) => {
+    setTimeout(resolve, Math.max(0, Number(durationMs) || 0));
+  });
+}
+
+function getVibrationStateTimerKey(uid, homeId, deviceId) {
+  return `${uid}|${homeId}|${deviceId}`;
+}
+
+function cancelVibrationStateClear(uid, homeId, deviceId) {
+  const timerKey = getVibrationStateTimerKey(uid, homeId, deviceId);
+  const timer = vibrationStateClearTimerMap.get(timerKey);
+
+  if (timer) {
+    clearTimeout(timer);
+    vibrationStateClearTimerMap.delete(timerKey);
+  }
+}
+
+function scheduleVibrationStateClear(
+  uid,
+  homeId,
+  deviceId,
+  eventTime,
+) {
+  const timerKey = getVibrationStateTimerKey(uid, homeId, deviceId);
+  cancelVibrationStateClear(uid, homeId, deviceId);
+
+  const timer = setTimeout(async () => {
+    vibrationStateClearTimerMap.delete(timerKey);
+
+    try {
+      const deviceRef = db.ref(
+        `accounts/${uid}/homes/${homeId}/devices/${deviceId}`,
+      );
+      const snap = await deviceRef.once("value");
+      const device = snap.val() || {};
+
+      // Chỉ clear đúng lần rung đã lên lịch. Lần rung mới hơn sẽ có timestamp
+      // khác và timer riêng, nên không bị timer cũ ghi đè.
+      if (Number(device.last_vibration_at || 0) !== eventTime) {
+        return;
+      }
+
+      await deviceRef.update({
+        vibration: false,
+        vibration_active_until: null,
+        updated_at: Date.now(),
+      });
+    } catch (error) {
+      console.log(
+        "VIBRATION STATE CLEAR ERROR:",
+        deviceId,
+        error.message,
+      );
+    }
+  }, VIBRATION_ACTIVE_WINDOW_MS + 250);
+
+  vibrationStateClearTimerMap.set(timerKey, timer);
 }
 
 function normalizeLockState(device) {
@@ -579,9 +1109,22 @@ function inferDeviceTypeFromPayload(
 
   if (
     data.carbon_monoxide !== undefined ||
-    data.co_alarm !== undefined
+    data.co_alarm !== undefined ||
+    data.co !== undefined
   ) {
     return "carbon_monoxide";
+  }
+
+  if (
+    data.alarm !== undefined &&
+    (
+      data.melody !== undefined ||
+      data.duration !== undefined ||
+      data.volume !== undefined ||
+      data.battpercentage !== undefined
+    )
+  ) {
+    return "siren";
   }
 
   if (
@@ -620,7 +1163,8 @@ function inferDeviceTypeFromPayload(
 
   if (
     data.vibration !== undefined ||
-    data.vibration_strength !== undefined
+    data.vibration_strength !== undefined ||
+    data.sensitivity !== undefined
   ) {
     return "vibration";
   }
@@ -659,6 +1203,36 @@ function getDeviceTypeFromModel(modelId, description, ieee) {
   if (id === "0xa4c138b872c891a2") return "temperature";
   if (id === "0xa4c1381162d4d15b") return "sos";
   if (id === "0xa4c13898b084dbdc") return "repeater";
+
+  // Bốn thiết bị mới đang dùng thực tế. Giữ nhận diện theo cả IEEE
+  // và model để pair lại vẫn đúng nếu người dùng đổi tên friendly_name.
+  if (
+    id === "0xa4c138ea6ee11777" ||
+    model === "dcr-co"
+  ) {
+    return "carbon_monoxide";
+  }
+
+  if (
+    id === "0xa4c13839bfd34161" ||
+    model === "809wzt"
+  ) {
+    return "motion";
+  }
+
+  if (
+    id === "0xa4c138f00d9289fc" ||
+    model === "ts0210"
+  ) {
+    return "vibration";
+  }
+
+  if (
+    id === "0xa4c1382b53b62852" ||
+    model === "nas-ab02b2"
+  ) {
+    return "siren";
+  }
 
   // Loại cụ thể phải được kiểm tra trước loại chung.
   if (
@@ -895,6 +1469,596 @@ const accountCache = new Map();
 const sharedByHomeCache = new Map();
 let backendDataCacheStarted = false;
 
+function getUserLanguageCode(uid) {
+  const cleanUid = String(uid || "").trim();
+  const account = cleanUid ? accountCache.get(cleanUid) : null;
+
+  return normalizeLanguageCode(
+    account?.languageCode ||
+    account?.profile?.languageCode ||
+    "vi",
+  );
+}
+
+function localizePushMessageForUser(uid, rawMessage) {
+  const languageCode = getUserLanguageCode(uid);
+  const message = JSON.parse(JSON.stringify(rawMessage || {}));
+
+  if (message.data && typeof message.data === "object") {
+    if (typeof message.data.title === "string") {
+      message.data.title = localizeBackendText(languageCode, message.data.title);
+    }
+    if (typeof message.data.body === "string") {
+      message.data.body = localizeBackendText(languageCode, message.data.body);
+    }
+    if (typeof message.data.reason === "string") {
+      message.data.reason = localizeBackendText(languageCode, message.data.reason);
+    }
+    if (typeof message.data.alarmItems === "string") {
+      message.data.alarmItems = localizeAlarmItemsJson(languageCode, message.data.alarmItems);
+    }
+    message.data.languageCode = languageCode;
+  }
+
+  if (message.notification && typeof message.notification === "object") {
+    if (typeof message.notification.title === "string") {
+      message.notification.title = localizeBackendText(languageCode, message.notification.title);
+    }
+    if (typeof message.notification.body === "string") {
+      message.notification.body = localizeBackendText(languageCode, message.notification.body);
+    }
+  }
+
+  const apnsAlert = message?.apns?.payload?.aps?.alert;
+  if (typeof apnsAlert === "string") {
+    message.apns.payload.aps.alert = localizeBackendText(languageCode, apnsAlert);
+  } else if (apnsAlert && typeof apnsAlert === "object") {
+    if (typeof apnsAlert.title === "string") {
+      apnsAlert.title = localizeBackendText(languageCode, apnsAlert.title);
+    }
+    if (typeof apnsAlert.body === "string") {
+      apnsAlert.body = localizeBackendText(languageCode, apnsAlert.body);
+    }
+  }
+
+  return message;
+}
+
+function ensureLocalRuntimeDirectory() {
+  fs.mkdirSync(LOCAL_RUNTIME_DIR, {
+    recursive: true,
+    mode: 0o700,
+  });
+
+  try {
+    fs.chmodSync(LOCAL_RUNTIME_DIR, 0o700);
+  } catch (_) { }
+}
+
+function readLocalJsonFile(filePath, fallbackValue) {
+  try {
+    if (!fs.existsSync(filePath)) {
+      return fallbackValue;
+    }
+
+    const raw = fs.readFileSync(filePath, "utf8");
+    return JSON.parse(raw);
+  } catch (error) {
+    console.log(
+      "LOCAL RUNTIME READ ERROR:",
+      path.basename(filePath),
+      error.message,
+    );
+    return fallbackValue;
+  }
+}
+
+function writeLocalJsonFileAtomic(filePath, value) {
+  ensureLocalRuntimeDirectory();
+  const tempPath = `${filePath}.tmp`;
+  fs.writeFileSync(
+    tempPath,
+    JSON.stringify(value),
+    "utf8",
+  );
+  fs.renameSync(tempPath, filePath);
+
+  try {
+    fs.chmodSync(filePath, 0o600);
+  } catch (_) { }
+}
+
+function buildLocalOfflineAccountSnapshot(rawAccount) {
+  const account = rawAccount || {};
+  const safeHomes = {};
+
+  for (const [homeId, rawHome] of Object.entries(
+    account.homes || {},
+  )) {
+    const home = rawHome || {};
+    const safeDevices = {};
+
+    for (const [deviceId, rawDevice] of Object.entries(
+      home.devices || {},
+    )) {
+      const device = rawDevice || {};
+      const {
+        notifications: _ignoredNotifications,
+        ...safeDevice
+      } = device;
+
+      safeDevices[deviceId] = safeDevice;
+    }
+
+    safeHomes[homeId] = {
+      name: home.name || homeId,
+      securityMode: home.securityMode || "normal",
+      securityModeRepeatMinutes:
+        home.securityModeRepeatMinutes ?? 0,
+      alarmPauseToday: home.alarmPauseToday || null,
+      devices: safeDevices,
+    };
+  }
+
+  return {
+    homes: safeHomes,
+    alarmSettings: account.alarmSettings || {},
+    customRules: account.customRules || {},
+    sharedHomes: account.sharedHomes || {},
+  };
+}
+
+function persistLocalRuntimeSnapshotNow() {
+  try {
+    writeLocalJsonFileAtomic(
+      LOCAL_RUNTIME_SNAPSHOT_FILE,
+      {
+        version: LOCAL_RUNTIME_SNAPSHOT_VERSION,
+        savedAt: Date.now(),
+        accounts: Object.fromEntries(
+          Array.from(accountCache.entries()).map(
+            ([uid, account]) => [
+              uid,
+              buildLocalOfflineAccountSnapshot(account),
+            ],
+          ),
+        ),
+        sharedByHome: Object.fromEntries(
+          sharedByHomeCache.entries(),
+        ),
+        deviceMap,
+      },
+    );
+  } catch (error) {
+    console.log(
+      "LOCAL SNAPSHOT SAVE ERROR:",
+      error.message,
+    );
+  }
+}
+
+function scheduleLocalRuntimeSnapshotSave() {
+  if (localRuntimeSnapshotSaveTimer) {
+    return;
+  }
+
+  localRuntimeSnapshotSaveTimer = setTimeout(() => {
+    localRuntimeSnapshotSaveTimer = null;
+    persistLocalRuntimeSnapshotNow();
+  }, LOCAL_RUNTIME_SNAPSHOT_SAVE_DELAY_MS);
+}
+
+function persistOfflineQueueNow() {
+  try {
+    writeLocalJsonFileAtomic(
+      LOCAL_OFFLINE_QUEUE_FILE,
+      {
+        version: 1,
+        savedAt: Date.now(),
+        operations: offlineOperationQueue,
+      },
+    );
+  } catch (error) {
+    console.log(
+      "OFFLINE QUEUE SAVE ERROR:",
+      error.message,
+    );
+  }
+}
+
+function scheduleOfflineQueueSave() {
+  if (offlineQueueSaveTimer) {
+    return;
+  }
+
+  offlineQueueSaveTimer = setTimeout(() => {
+    offlineQueueSaveTimer = null;
+    persistOfflineQueueNow();
+  }, 250);
+}
+
+function loadLocalRuntimeState() {
+  ensureLocalRuntimeDirectory();
+
+  const snapshot = readLocalJsonFile(
+    LOCAL_RUNTIME_SNAPSHOT_FILE,
+    null,
+  );
+
+  if (
+    snapshot &&
+    snapshot.version === LOCAL_RUNTIME_SNAPSHOT_VERSION
+  ) {
+    for (const [uid, account] of Object.entries(
+      snapshot.accounts || {},
+    )) {
+      accountCache.set(uid, account || {});
+    }
+
+    for (const [homeId, members] of Object.entries(
+      snapshot.sharedByHome || {},
+    )) {
+      sharedByHomeCache.set(homeId, members || {});
+    }
+
+    for (const [deviceId, map] of Object.entries(
+      snapshot.deviceMap || {},
+    )) {
+      if (map?.uid && map?.homeId) {
+        deviceMap[deviceId] = {
+          uid: String(map.uid),
+          homeId: String(map.homeId),
+        };
+      }
+    }
+
+    console.log(
+      "💾 LOCAL FIREBASE SNAPSHOT LOADED:",
+      `accounts=${accountCache.size}`,
+      `homes=${sharedByHomeCache.size}`,
+      `devices=${Object.keys(deviceMap).length}`,
+      `savedAt=${Number(snapshot.savedAt || 0)}`,
+    );
+  }
+
+  const queueData = readLocalJsonFile(
+    LOCAL_OFFLINE_QUEUE_FILE,
+    null,
+  );
+  const storedOperations = Array.isArray(
+    queueData?.operations,
+  )
+    ? queueData.operations
+    : [];
+
+  offlineOperationQueue.splice(
+    0,
+    offlineOperationQueue.length,
+    ...storedOperations.slice(-OFFLINE_QUEUE_MAX_ITEMS),
+  );
+
+  if (offlineOperationQueue.length > 0) {
+    console.log(
+      "📥 OFFLINE QUEUE LOADED:",
+      offlineOperationQueue.length,
+    );
+  }
+}
+
+function applyDeviceUpdateToLocalCache(
+  ownerUid,
+  homeId,
+  deviceId,
+  updateData,
+) {
+  const cleanOwnerUid = String(ownerUid || "").trim();
+  const cleanHomeId = String(homeId || "").trim();
+  const cleanDeviceId = String(deviceId || "").trim();
+
+  if (!cleanOwnerUid || !cleanHomeId || !cleanDeviceId) {
+    return null;
+  }
+
+  const account = accountCache.get(cleanOwnerUid) || {};
+  const homes = account.homes || {};
+  const home = homes[cleanHomeId] || {};
+  const devices = home.devices || {};
+  const nextDevice = {
+    ...(devices[cleanDeviceId] || {}),
+    ...(updateData || {}),
+  };
+  const nextHome = {
+    ...home,
+    devices: {
+      ...devices,
+      [cleanDeviceId]: nextDevice,
+    },
+  };
+
+  accountCache.set(cleanOwnerUid, {
+    ...account,
+    homes: {
+      ...homes,
+      [cleanHomeId]: nextHome,
+    },
+  });
+
+  scheduleLocalRuntimeSnapshotSave();
+  return nextHome;
+}
+
+function getOfflineOperationIdentity(operation) {
+  if (operation?.type === "firebase_update") {
+    return `firebase_update|${String(operation.path || "")}`;
+  }
+
+  if (operation?.type === "alarm_item") {
+    const itemType = String(
+      operation.item?.type || "",
+    ).trim();
+    const isTransient = [
+      "sos",
+      "vibration",
+      "glass_break",
+      "motion",
+      "presence",
+    ].includes(itemType);
+    const timeBucket = isTransient
+      ? Math.floor(
+          Number(operation.queuedAt || 0) /
+          EMERGENCY_MERGE_WINDOW_MS,
+        )
+      : 0;
+
+    return [
+      "alarm_item",
+      String(operation.receiverUid || ""),
+      getAlarmIncidentItemIdentity(operation.item || {}),
+      String(timeBucket),
+    ].join("|");
+  }
+
+  return String(operation?.id || "");
+}
+
+function enqueueOfflineOperation(operation) {
+  if (!operation || !operation.type) {
+    return;
+  }
+
+  const normalized = {
+    ...operation,
+    id: operation.id || (
+      typeof crypto.randomUUID === "function"
+        ? crypto.randomUUID()
+        : crypto.randomBytes(16).toString("hex")
+    ),
+    queuedAt: Number(operation.queuedAt || Date.now()),
+  };
+  const identity = getOfflineOperationIdentity(normalized);
+  const existingIndex = offlineOperationQueue.findIndex(
+    (item) => getOfflineOperationIdentity(item) === identity,
+  );
+
+  if (
+    normalized.type === "firebase_update" &&
+    existingIndex >= 0
+  ) {
+    const existing = offlineOperationQueue[existingIndex];
+    offlineOperationQueue[existingIndex] = {
+      ...existing,
+      ...normalized,
+      data: {
+        ...(existing.data || {}),
+        ...(normalized.data || {}),
+      },
+      queuedAt: existing.queuedAt || normalized.queuedAt,
+    };
+  } else if (existingIndex < 0) {
+    offlineOperationQueue.push(normalized);
+  }
+
+  if (offlineOperationQueue.length > OFFLINE_QUEUE_MAX_ITEMS) {
+    offlineOperationQueue.splice(
+      0,
+      offlineOperationQueue.length - OFFLINE_QUEUE_MAX_ITEMS,
+    );
+  }
+
+  scheduleOfflineQueueSave();
+}
+
+function enqueueOfflineFirebaseUpdate(refPath, data) {
+  enqueueOfflineOperation({
+    type: "firebase_update",
+    path: String(refPath || "").trim(),
+    data: data || {},
+  });
+}
+
+function enqueueOfflineAlarmItem(receiverUid, item) {
+  enqueueOfflineOperation({
+    type: "alarm_item",
+    receiverUid: String(receiverUid || "").trim(),
+    item,
+  });
+}
+
+function isQueuedAlarmOperationStillRelevant(operation) {
+  const item = operation?.item || {};
+  const ownerUid = String(item.ownerUid || "").trim();
+  const homeId = String(item.homeId || "").trim();
+  const home = getCachedHomeData(ownerUid, homeId);
+  const queuedAt = Number(operation?.queuedAt || 0);
+  const type = String(item.type || "").trim();
+
+  if (!home) {
+    return true;
+  }
+
+  if (isPersistentEmergencyIncidentItem(item)) {
+    return isEmergencyIncidentItemStillUnsafe(home, item);
+  }
+
+  if (
+    [
+      "sos",
+      "vibration",
+      "glass_break",
+      "motion",
+      "presence",
+    ].includes(type)
+  ) {
+    return (
+      queuedAt > 0 &&
+      Date.now() - queuedAt <=
+        OFFLINE_TRANSIENT_ALARM_TTL_MS
+    );
+  }
+
+  return true;
+}
+
+async function flushOfflineOperationQueue() {
+  if (
+    !firebaseConnected ||
+    offlineQueueFlushInProgress ||
+    offlineOperationQueue.length === 0
+  ) {
+    return;
+  }
+
+  offlineQueueFlushInProgress = true;
+  let completed = 0;
+
+  try {
+    while (
+      firebaseConnected &&
+      offlineOperationQueue.length > 0
+    ) {
+      const alarmIndex = offlineOperationQueue.findIndex(
+        (item) => item?.type === "alarm_item",
+      );
+      const operationIndex = alarmIndex >= 0
+        ? alarmIndex
+        : 0;
+      const operation = offlineOperationQueue[operationIndex];
+
+      if (operation.type === "firebase_update") {
+        if (!operation.path) {
+          offlineOperationQueue.splice(operationIndex, 1);
+          continue;
+        }
+
+        await db
+          .ref(operation.path)
+          .update(operation.data || {});
+      } else if (operation.type === "alarm_item") {
+        if (
+          !operation.receiverUid ||
+          !operation.item ||
+          !isQueuedAlarmOperationStillRelevant(operation)
+        ) {
+          offlineOperationQueue.splice(operationIndex, 1);
+          continue;
+        }
+
+        await startOrMergeAlarmIncidents(
+          operation.receiverUid,
+          [operation.item],
+        );
+      }
+
+      offlineOperationQueue.splice(operationIndex, 1);
+      completed++;
+
+      if (completed >= 50) {
+        break;
+      }
+    }
+  } catch (error) {
+    console.log(
+      "OFFLINE QUEUE FLUSH PAUSED:",
+      error.message,
+    );
+  } finally {
+    offlineQueueFlushInProgress = false;
+    persistOfflineQueueNow();
+  }
+
+  if (completed > 0) {
+    console.log(
+      "📤 OFFLINE QUEUE FLUSHED:",
+      completed,
+      `remaining=${offlineOperationQueue.length}`,
+    );
+  }
+}
+
+function startOfflineQueueFlushTimer() {
+  if (offlineQueueFlushTimer) {
+    return;
+  }
+
+  offlineQueueFlushTimer = setInterval(() => {
+    void flushOfflineOperationQueue();
+  }, OFFLINE_QUEUE_FLUSH_INTERVAL_MS);
+}
+
+function startFirebaseConnectionMonitor() {
+  if (firebaseConnectionMonitorStarted) {
+    return;
+  }
+
+  firebaseConnectionMonitorStarted = true;
+
+  db.ref(".info/connected").on("value", (snapshot) => {
+    const nextConnected = snapshot.val() === true;
+    const changed = firebaseConnected !== nextConnected;
+    firebaseConnected = nextConnected;
+
+    if (changed) {
+      console.log(
+        nextConnected
+          ? "☁️ FIREBASE CONNECTED"
+          : "📴 FIREBASE OFFLINE - LOCAL ALARM MODE",
+      );
+    }
+
+    if (!nextConnected) {
+      void resumeOfflineAlarmDemandsFromSnapshot().catch((error) => {
+        console.log(
+          "OFFLINE ALARM RESUME ERROR:",
+          error.message,
+        );
+      });
+      return;
+    }
+
+    scheduleLocalRuntimeSnapshotSave();
+
+    setTimeout(() => {
+      void (async () => {
+        await flushOfflineOperationQueue();
+
+        try {
+          await resumeActiveAlarmIncidents();
+        } catch (error) {
+          console.log(
+            "ALARM RESUME AFTER RECONNECT ERROR:",
+            error.message,
+          );
+        }
+
+        await reconcileAllPhysicalSirens({
+          force: true,
+          reason: "firebase_reconnected",
+        });
+      })();
+    }, 1000);
+  });
+}
+
 function getCachedAccountsObject() {
   return Object.fromEntries(accountCache.entries());
 }
@@ -972,6 +2136,7 @@ function startDeviceMapListener() {
     }
 
     deviceMap[deviceId] = { uid, homeId };
+    scheduleLocalRuntimeSnapshotSave();
   };
 
   const removeDevice = (snap) => {
@@ -979,6 +2144,7 @@ function startDeviceMapListener() {
 
     if (deviceId) {
       delete deviceMap[deviceId];
+      scheduleLocalRuntimeSnapshotSave();
     }
   };
 
@@ -1009,6 +2175,7 @@ async function startBackendDataCache() {
     const previousAccount = accountCache.get(uid) || null;
 
     accountCache.set(uid, account);
+    scheduleLocalRuntimeSnapshotSave();
 
     if (previousAccount) {
       void handleAlarmRelevantAccountChange(
@@ -1035,6 +2202,7 @@ async function startBackendDataCache() {
     }
 
     accountCache.delete(uid);
+    scheduleLocalRuntimeSnapshotSave();
 
     for (const key of Array.from(
       localActiveAlarmIncidentMap.keys(),
@@ -1058,6 +2226,7 @@ async function startBackendDataCache() {
 
     if (homeId) {
       sharedByHomeCache.set(homeId, snap.val() || {});
+      scheduleLocalRuntimeSnapshotSave();
     }
   };
 
@@ -1066,6 +2235,7 @@ async function startBackendDataCache() {
 
     if (homeId) {
       sharedByHomeCache.delete(homeId);
+      scheduleLocalRuntimeSnapshotSave();
     }
   };
 
@@ -1129,6 +2299,7 @@ async function startBackendDataCache() {
   }
 
   await Promise.all(directorySyncTasks);
+  persistLocalRuntimeSnapshotNow();
 
   console.log(
     "🗂️ BACKEND DATA CACHE READY:",
@@ -1158,63 +2329,99 @@ function normalizeFcmToken(raw) {
 }
 
 async function getUserFcmTargets(uid) {
+  const cleanUid = String(uid || "").trim();
+
+  if (!cleanUid) {
+    return [];
+  }
+
   const accountSnap = await db
-    .ref(`accounts/${uid}`)
+    .ref(`accounts/${cleanUid}`)
     .once("value");
 
   const account = accountSnap.val() || {};
-  const targetsByToken = new Map();
-
-  function addTarget(tokenValue, path) {
-    const token = normalizeFcmToken(tokenValue);
-
-    if (!token || !path) {
-      return;
-    }
-
-    if (!targetsByToken.has(token)) {
-      targetsByToken.set(token, {
-        token,
-        paths: new Set(),
-      });
-    }
-
-    targetsByToken.get(token).paths.add(path);
-  }
-
-  addTarget(
-    account.fcmToken,
-    `accounts/${uid}/fcmToken`,
-  );
-
-  const installations =
-    account.fcmTokens &&
-    typeof account.fcmTokens === "object"
-      ? account.fcmTokens
+  const activeSession =
+    account.activeSession &&
+    typeof account.activeSession === "object"
+      ? account.activeSession
       : {};
 
-  for (const [installationId, rawEntry] of Object.entries(
-    installations,
-  )) {
-    const entryPath =
-      `accounts/${uid}/fcmTokens/${installationId}`;
+  const installationId = String(
+    activeSession.installationId || "",
+  ).trim();
+  const sessionId = String(
+    activeSession.sessionId || "",
+  ).trim();
 
-    if (typeof rawEntry === "string") {
-      addTarget(rawEntry, entryPath);
-      continue;
-    }
-
-    if (rawEntry && typeof rawEntry === "object") {
-      addTarget(rawEntry.token, entryPath);
-    }
+  if (!installationId || !sessionId) {
+    console.log(
+      "❌ NO ACTIVE SESSION FOR PUSH:",
+      cleanUid,
+    );
+    return [];
   }
 
-  return Array.from(targetsByToken.values()).map(
-    (target) => ({
-      token: target.token,
-      paths: Array.from(target.paths),
-    }),
-  );
+  const session =
+    account.sessions?.[installationId] &&
+    typeof account.sessions[installationId] === "object"
+      ? account.sessions[installationId]
+      : null;
+
+  if (
+    session &&
+    (
+      String(session.sessionId || "").trim() !== sessionId ||
+      session.signedIn === false
+    )
+  ) {
+    console.log(
+      "❌ ACTIVE SESSION RECORD MISMATCH:",
+      cleanUid,
+      installationId,
+    );
+    return [];
+  }
+
+  const tokenEntry =
+    account.fcmTokens?.[installationId];
+
+  if (
+    !tokenEntry ||
+    typeof tokenEntry !== "object"
+  ) {
+    console.log(
+      "❌ NO ACTIVE INSTALLATION TOKEN:",
+      cleanUid,
+      installationId,
+    );
+    return [];
+  }
+
+  const tokenSessionId = String(
+    tokenEntry.sessionId || "",
+  ).trim();
+  const token = normalizeFcmToken(tokenEntry.token);
+
+  if (
+    !token ||
+    tokenSessionId !== sessionId
+  ) {
+    console.log(
+      "❌ ACTIVE TOKEN SESSION MISMATCH:",
+      cleanUid,
+      installationId,
+    );
+    return [];
+  }
+
+  return [
+    {
+      token,
+      paths: [
+        `accounts/${cleanUid}/fcmTokens/${installationId}`,
+      ],
+    },
+  ];
 }
 
 function isInvalidFcmTokenError(error) {
@@ -1254,6 +2461,7 @@ async function sendPushToUser(
   logLabel = "PUSH",
 ) {
   const targets = await getUserFcmTargets(uid);
+  const localizedMessage = localizePushMessageForUser(uid, message);
 
   if (targets.length === 0) {
     console.log(
@@ -1277,7 +2485,7 @@ async function sendPushToUser(
   for (const target of targets) {
     try {
       await admin.messaging().send({
-        ...message,
+        ...localizedMessage,
         token: target.token,
       });
 
@@ -1396,7 +2604,7 @@ async function sendScheduledReminderSummary(uid, items) {
     const title =
       uniqueItems.length === 1
         ? uniqueItems[0].homeName || "Nhà"
-        : "SafeHome Reminder";
+        : "Nhắc nhở SafeHome";
 
     let body = "";
 
@@ -1524,8 +2732,8 @@ async function sendScheduledNotification(
       category: "reminder",
       severity: isSafe ? "success" : "warning",
       title: isSafe
-        ? "Reminder: Nhà đã an toàn"
-        : "Reminder: Cần kiểm tra",
+        ? "Nhắc nhở: Nhà đã an toàn"
+        : "Nhắc nhở: Cần kiểm tra",
       message: isSafe
         ? "Nhà đang an toàn. Hãy an tâm nghỉ ngơi."
         : `Cần kiểm tra: ${reason ||
@@ -1617,11 +2825,16 @@ async function clearHomeAlarmPause(ownerUid, homeId, sharedUsers = null) {
 
 async function isHomeAlarmPausedToday(ownerUid, homeId) {
   try {
-    const snap = await db
-      .ref(`accounts/${ownerUid}/homes/${homeId}/alarmPauseToday`)
-      .once("value");
+    const cachedHome = getCachedHomeData(ownerUid, homeId);
+    let pause = cachedHome?.alarmPauseToday;
 
-    const pause = snap.val();
+    if (!cachedHome) {
+      const snap = await db
+        .ref(`accounts/${ownerUid}/homes/${homeId}/alarmPauseToday`)
+        .once("value");
+
+      pause = snap.val();
+    }
 
     if (!pause) return false;
 
@@ -1710,21 +2923,10 @@ async function canReceiveAlarm(
   options = {},
 ) {
   try {
-    const settingSnap = await db
-      .ref(`accounts/${uid}/alarmSettings/${homeId}/enabled`)
-      .once("value");
-
-    const enabled = settingSnap.val();
-
-    // Mặc định là bật, chỉ tắt khi user chủ động set false.
-    if (enabled === false) {
-      return false;
-    }
-
     const respectPause = options?.respectPause !== false;
 
-    // Tạm tắt Alarm hôm nay chỉ áp dụng cho Alarm theo giờ.
-    // Mode Bảo vệ và cảnh báo khẩn cấp không bị chặn bởi pause.
+    // Công tắc Alarm cấp user cũ không còn tham gia quyết định Alarm.
+    // Mode nhà là nguồn điều khiển duy nhất; Pause Today chỉ chặn Alarm theo lịch.
     if (respectPause) {
       const paused = await isHomeAlarmPausedToday(ownerUid, homeId);
 
@@ -1736,7 +2938,7 @@ async function canReceiveAlarm(
 
     return true;
   } catch (err) {
-    console.log("ALARM SETTING CHECK ERROR:", err.message);
+    console.log("ALARM PAUSE CHECK ERROR:", err.message);
     return true;
   }
 }
@@ -1864,6 +3066,10 @@ async function addHomeNotificationFromBackend({
   message,
   category = "home",
   severity = "info",
+
+  eventCategory = "",
+  alarmLevel = "",
+
   entityType = "home",
   entityId = "",
 }) {
@@ -1875,6 +3081,15 @@ async function addHomeNotificationFromBackend({
     const now = Date.now();
     const resolvedHomeName =
       String(homeName || "").trim() || homeId;
+    const languageCode = getUserLanguageCode(uid);
+    const localizedTitle = localizeBackendText(
+      languageCode,
+      String(title || ""),
+    );
+    const localizedMessage = localizeBackendText(
+      languageCode,
+      String(message || ""),
+    );
 
     const listRef = db.ref(
       `accounts/${uid}/notifications`,
@@ -1887,8 +3102,15 @@ async function addHomeNotificationFromBackend({
       type,
       category,
       severity,
-      title,
-      message,
+
+      // Chuẩn Alarm Engine dùng chung cho backend/Firebase/app.
+      // Giữ severity cũ để tương thích với frontend hiện tại.
+      eventCategory: String(eventCategory || ""),
+      alarmLevel: String(alarmLevel || ""),
+
+      title: localizedTitle,
+      message: localizedMessage,
+      languageCode,
       homeId,
       homeName: resolvedHomeName,
       entityType,
@@ -1919,6 +3141,106 @@ async function addHomeNotificationFromBackend({
     );
   }
 }
+async function sendUnprotectedSensorNotification(
+  receiverUid,
+  {
+    ownerUid,
+    homeId,
+    homeName,
+    deviceId,
+    deviceName,
+    deviceType,
+    reason,
+    eventCategory,
+  },
+) {
+  const title = String(homeName || "Nhà").trim() || "Nhà";
+  const body = String(reason || "Có sự kiện cảm biến").trim();
+  const notificationKey = [
+    "unprotected",
+    receiverUid,
+    homeId,
+    deviceId,
+    body,
+  ].join("|");
+  const now = Date.now();
+
+  if (
+    lastNotificationMap[notificationKey] &&
+    now - lastNotificationMap[notificationKey] < 30 * 1000
+  ) {
+    return;
+  }
+
+  lastNotificationMap[notificationKey] = now;
+
+  await addHomeNotificationFromBackend({
+    uid: receiverUid,
+    homeId,
+    homeName: title,
+    type: "sensor_notification",
+    title,
+    message: body,
+    category: "sensor",
+    severity: eventCategory === SENSOR_EVENT_CATEGORY.EMERGENCY
+      ? "warning"
+      : "info",
+    eventCategory,
+    alarmLevel: "warning",
+    entityType: "device",
+    entityId: deviceId,
+  });
+
+  const data = {
+    type: "sensor_notification",
+    title,
+    body,
+    ownerUid: String(ownerUid || ""),
+    homeId: String(homeId || ""),
+    homeName: title,
+    deviceId: String(deviceId || ""),
+    deviceName: String(deviceName || ""),
+    deviceType: String(deviceType || ""),
+    reason: body,
+    eventCategory: String(eventCategory || ""),
+    alarmLevel: "warning",
+    securityMode: "unprotected",
+    clickAction: "sensor_notification",
+  };
+
+  await sendPushToUser(
+    receiverUid,
+    {
+      data,
+      notification: {
+        title,
+        body,
+      },
+      android: {
+        priority: "high",
+        notification: {
+          channelId: "safehome_sensor_notification_v1",
+          sound: "default",
+          tag: `safehome_sensor_${homeId}_${deviceId}`,
+        },
+      },
+      apns: {
+        headers: {
+          "apns-priority": "10",
+        },
+        payload: {
+          aps: {
+            alert: { title, body },
+            sound: "default",
+            threadId: `safehome_sensor_${homeId}`,
+          },
+        },
+      },
+    },
+    "UNPROTECTED SENSOR NOTIFICATION",
+  );
+}
+
 function getAlarmIncidentTargetKey(
   receiverUid,
   ownerUid,
@@ -1975,6 +3297,25 @@ function setLocalActiveAlarmIncident(
   );
 }
 
+function hasLocalActiveAlarmIncidentForReceiver(receiverUid) {
+  const prefix = `${String(receiverUid || "").trim()}|`;
+
+  if (prefix === "|") {
+    return false;
+  }
+
+  for (const [key, value] of localActiveAlarmIncidentMap.entries()) {
+    if (
+      key.startsWith(prefix) &&
+      value?.incident?.status === "active"
+    ) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 function removeLocalActiveAlarmIncident(
   receiverUid,
   targetKey,
@@ -2016,6 +3357,34 @@ function clearAlarmIncidentTimers(uid, incidentId) {
       alarmIncidentStageRetryCountMap.delete(retryKey);
     }
   }
+}
+
+function rescheduleAlarmIncidentExpireTimer(
+  receiverUid,
+  incidentId,
+  expireAt,
+) {
+  const key = getAlarmIncidentTimerKey(
+    receiverUid,
+    incidentId,
+  );
+  const timers = alarmIncidentTimerMap[key] || {};
+
+  if (timers.expire) {
+    clearTimeout(timers.expire);
+  }
+
+  timers.expire = setTimeout(
+    () => {
+      void expireAlarmIncident(
+        receiverUid,
+        incidentId,
+      );
+    },
+    Math.max(0, Number(expireAt || 0) - Date.now()),
+  );
+
+  alarmIncidentTimerMap[key] = timers;
 }
 
 function getAlarmStagePriority(stage) {
@@ -2311,6 +3680,7 @@ function getAlarmIncidentItemIdentity(item) {
 
 function normalizeAlarmIncidentItems(items) {
   const uniqueItems = [];
+  const seenIdentities = new Set();
 
   for (const rawItem of Array.isArray(items) ? items : []) {
     const item = rawItem || {};
@@ -2321,14 +3691,12 @@ function normalizeAlarmIncidentItems(items) {
       continue;
     }
 
-    const exists = uniqueItems.some((oldItem) => {
-      return (
-        oldItem.homeId === homeId &&
-        oldItem.reason === reason
-      );
-    });
+    // Không chỉ so sánh homeId + reason: hai cảm biến cùng tên/lý do trong
+    // một nhà vẫn phải được giữ thành hai item độc lập.
+    const identity = getAlarmIncidentItemIdentity(item);
 
-    if (!exists) {
+    if (!seenIdentities.has(identity)) {
+      seenIdentities.add(identity);
       uniqueItems.push({
         ownerUid: String(item.ownerUid || "").trim(),
         homeId,
@@ -2345,6 +3713,26 @@ function normalizeAlarmIncidentItems(items) {
         alarmSource:
           String(item.alarmSource || "scheduled_alarm").trim() ||
           "scheduled_alarm",
+        eventCategory: String(
+          item.eventCategory || "",
+        ).trim(),
+        alarmLevel: String(
+          item.alarmLevel || item.severity || "",
+        ).trim(),
+        physicalSirenEnabled:
+          item.physicalSirenEnabled !== false,
+        fullscreenEnabled:
+          item.fullscreenEnabled !== false,
+        triggerDelaySeconds: Math.min(
+          120,
+          Math.max(
+            0,
+            Number.parseInt(
+              item.triggerDelaySeconds || 0,
+              10,
+            ) || 0,
+          ),
+        ),
       });
     }
   }
@@ -2433,6 +3821,918 @@ function getCachedHomeData(ownerUid, homeId) {
   }
 
   return ownerAccount?.homes?.[homeId] || null;
+}
+
+
+// Một nguồn duy nhất cho danh sách người nhận Alarm của Home:
+// Chủ nhà + các UID đang có trong sharedByHome/{homeId}.
+function getAlarmReceiverUidsForHome(ownerUid, homeId) {
+  const cleanOwnerUid = String(ownerUid || "").trim();
+  const cleanHomeId = String(homeId || "").trim();
+
+  if (!cleanOwnerUid || !cleanHomeId) {
+    return [];
+  }
+
+  const receiverUids = new Set([cleanOwnerUid]);
+  const sharedMembers =
+    sharedByHomeCache.get(cleanHomeId) || {};
+
+  for (const sharedUid of Object.keys(sharedMembers)) {
+    const cleanUid = String(sharedUid || "").trim();
+
+    // Không ghi incident vào một UID đã bị xóa khỏi /accounts.
+    if (cleanUid && getCachedAccountData(cleanUid)) {
+      receiverUids.add(cleanUid);
+    }
+  }
+
+  return Array.from(receiverUids);
+}
+
+
+function getHomeSirenRuntimeKey(ownerUid, homeId) {
+  return `${String(ownerUid || "").trim()}|${String(homeId || "").trim()}`;
+}
+
+function getHomeSirenIncidentMuteKey(receiverUid, incidentId) {
+  return crypto
+    .createHash("sha256")
+    .update(
+      `${String(receiverUid || "").trim()}|${String(incidentId || "").trim()}`,
+    )
+    .digest("hex")
+    .slice(0, 24);
+}
+
+function normalizeHomeSirenManualMute(value) {
+  if (!value || value.active !== true) {
+    return null;
+  }
+
+  const mutedIncidentKeys = {};
+
+  for (const [key, enabled] of Object.entries(
+    value.mutedIncidentKeys || {},
+  )) {
+    const cleanKey = String(key || "").trim();
+
+    if (cleanKey && enabled === true) {
+      mutedIncidentKeys[cleanKey] = true;
+    }
+  }
+
+  if (Object.keys(mutedIncidentKeys).length === 0) {
+    return null;
+  }
+
+  return {
+    active: true,
+    mutedAt: Number(value.mutedAt || 0),
+    mutedBy: String(value.mutedBy || "").trim(),
+    mutedIncidentKeys,
+  };
+}
+
+async function getHomeSirenManualMute(
+  ownerUid,
+  homeId,
+  { useDatabase = false } = {},
+) {
+  const runtimeKey = getHomeSirenRuntimeKey(ownerUid, homeId);
+
+  if (homeSirenManualMuteRuntimeMap.has(runtimeKey)) {
+    return homeSirenManualMuteRuntimeMap.get(runtimeKey);
+  }
+
+  let rawValue = null;
+  const cachedHome = getCachedHomeData(ownerUid, homeId);
+
+  if (useDatabase || !cachedHome) {
+    const snap = await db
+      .ref(
+        `accounts/${ownerUid}/homes/${homeId}/sirenManualMute`,
+      )
+      .once("value");
+    rawValue = snap.val();
+  } else {
+    rawValue = cachedHome.sirenManualMute;
+  }
+
+  const normalized = normalizeHomeSirenManualMute(rawValue);
+  homeSirenManualMuteRuntimeMap.set(runtimeKey, normalized);
+  return normalized;
+}
+
+async function clearHomeSirenManualMute(ownerUid, homeId) {
+  const runtimeKey = getHomeSirenRuntimeKey(ownerUid, homeId);
+  homeSirenManualMuteRuntimeMap.set(runtimeKey, null);
+
+  await db
+    .ref(
+      `accounts/${ownerUid}/homes/${homeId}/sirenManualMute`,
+    )
+    .remove();
+}
+
+function normalizeHomeSirenVolume(value) {
+  const normalized = String(value || "").trim().toLowerCase();
+
+  return ["low", "medium", "high"].includes(normalized)
+    ? normalized
+    : HOME_SIREN_DEFAULT_VOLUME;
+}
+
+function normalizeHomeSirenMelody(value) {
+  const melody = Number.parseInt(value, 10);
+
+  return Number.isFinite(melody) && melody >= 1 && melody <= 18
+    ? String(melody)
+    : HOME_SIREN_DEFAULT_MELODY;
+}
+
+function normalizeHomeSirenDuration(value) {
+  const duration = Number.parseInt(value, 10);
+
+  return Number.isFinite(duration) && duration >= 1 && duration <= 1800
+    ? duration
+    : HOME_SIREN_COMMAND_DURATION_SEC;
+}
+
+function getHomeSirenDevicesFromHome(home) {
+  const devices = home?.devices || {};
+
+  return Object.entries(devices)
+    .filter(([, device]) => {
+      return String(device?.type || "").trim() === "siren";
+    })
+    .map(([deviceId, device]) => ({
+      deviceId,
+      device: device || {},
+    }));
+}
+
+async function getHomeSirenDevices(ownerUid, homeId) {
+  let home = getCachedHomeData(ownerUid, homeId);
+
+  if (!home) {
+    try {
+      const snap = await db
+        .ref(`accounts/${ownerUid}/homes/${homeId}`)
+        .once("value");
+      home = snap.val() || null;
+    } catch (error) {
+      console.log(
+        "HOME SIREN LOAD HOME ERROR:",
+        ownerUid,
+        homeId,
+        error.message,
+      );
+    }
+  }
+
+  return getHomeSirenDevicesFromHome(home);
+}
+
+function publishHomeSirenMqtt(deviceId, payload) {
+  return new Promise((resolve) => {
+    if (!client.connected) {
+      resolve({
+        ok: false,
+        error: "mqtt_offline",
+      });
+      return;
+    }
+
+    client.publish(
+      `zigbee2mqtt/${deviceId}/set`,
+      JSON.stringify(payload),
+      {
+        qos: 1,
+        retain: false,
+      },
+      (error) => {
+        resolve({
+          ok: !error,
+          error: error?.message || "",
+        });
+      },
+    );
+  });
+}
+
+function getCachedHomeSirenReport(
+  ownerUid,
+  homeId,
+  deviceId,
+) {
+  const home = getCachedHomeData(ownerUid, homeId);
+  const device = home?.devices?.[deviceId];
+
+  if (!device || device.alarm === undefined) {
+    return null;
+  }
+
+  return {
+    alarmOn: isActiveSignal(device.alarm),
+    reportedAt: Number(device.last_siren_report_at || 0),
+  };
+}
+
+async function waitForHomeSirenReportedOff(
+  ownerUid,
+  homeId,
+  deviceId,
+  commandStartedAt,
+  timeoutMs = HOME_SIREN_STOP_CONFIRM_WAIT_MS,
+) {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    const report = getCachedHomeSirenReport(
+      ownerUid,
+      homeId,
+      deviceId,
+    );
+
+    if (
+      report &&
+      report.alarmOn === false &&
+      report.reportedAt >= commandStartedAt
+    ) {
+      return true;
+    }
+
+    await waitMs(120);
+  }
+
+  try {
+    const snap = await db
+      .ref(
+        `accounts/${ownerUid}/homes/${homeId}/devices/${deviceId}`,
+      )
+      .once("value");
+    const device = snap.val() || {};
+
+    return (
+      device.alarm !== undefined &&
+      !isActiveSignal(device.alarm) &&
+      Number(device.last_siren_report_at || 0) >= commandStartedAt
+    );
+  } catch (_) {
+    return false;
+  }
+}
+
+async function setPhysicalSirenForHome(
+  ownerUid,
+  homeId,
+  shouldTurnOn,
+  {
+    force = false,
+    reason = "alarm_incident",
+  } = {},
+) {
+  const cleanOwnerUid = String(ownerUid || "").trim();
+  const cleanHomeId = String(homeId || "").trim();
+
+  if (!cleanOwnerUid || !cleanHomeId) {
+    return {
+      status: "invalid_home",
+      deviceCount: 0,
+      successCount: 0,
+      confirmedCount: 0,
+    };
+  }
+
+  const devices = await getHomeSirenDevices(
+    cleanOwnerUid,
+    cleanHomeId,
+  );
+  const deviceIds = devices
+    .map((item) => item.deviceId)
+    .sort();
+  const deviceSignature = deviceIds.join(",");
+  const runtimeKey = getHomeSirenRuntimeKey(
+    cleanOwnerUid,
+    cleanHomeId,
+  );
+  const previous = homeSirenRuntimeMap.get(runtimeKey) || {};
+  const now = Date.now();
+  const needsRefresh =
+    shouldTurnOn &&
+    now - Number(previous.lastCommandAt || 0) >=
+      HOME_SIREN_REFRESH_INTERVAL_MS;
+  const stableStatus = shouldTurnOn
+    ? previous.status === "active"
+    : previous.status === "stopped";
+
+  if (
+    !force &&
+    previous.desiredOn === shouldTurnOn &&
+    previous.deviceSignature === deviceSignature &&
+    stableStatus &&
+    !needsRefresh
+  ) {
+    return {
+      status: previous.status,
+      deviceCount: deviceIds.length,
+      successCount: deviceIds.length,
+      confirmedCount: Number(
+        previous.confirmedCount ?? deviceIds.length,
+      ),
+      skipped: true,
+    };
+  }
+
+  // Đổi desiredOn trước khi publish OFF để packet phản hồi `alarm:false`
+  // không bị nhánh tự bật lại coi là còi tự tắt khi incident vẫn active.
+  homeSirenRuntimeMap.set(runtimeKey, {
+    ...previous,
+    desiredOn: shouldTurnOn,
+    deviceSignature,
+    reason,
+    updatedAt: now,
+  });
+
+  if (devices.length === 0) {
+    homeSirenRuntimeMap.set(runtimeKey, {
+      desiredOn: shouldTurnOn,
+      deviceSignature,
+      status: "no_devices",
+      lastCommandAt: 0,
+      confirmedCount: 0,
+      reason,
+      updatedAt: now,
+    });
+
+    console.log(
+      "📢 HOME SIREN NO DEVICE:",
+      cleanOwnerUid,
+      cleanHomeId,
+      shouldTurnOn ? "ON" : "OFF",
+      reason,
+    );
+
+    return {
+      status: "no_devices",
+      deviceCount: 0,
+      successCount: 0,
+      confirmedCount: 0,
+    };
+  }
+
+  if (!client.connected) {
+    homeSirenRuntimeMap.set(runtimeKey, {
+      desiredOn: shouldTurnOn,
+      deviceSignature,
+      status: "mqtt_offline",
+      lastCommandAt: 0,
+      confirmedCount: 0,
+      reason,
+      updatedAt: now,
+    });
+
+    console.log(
+      "📢 HOME SIREN MQTT OFFLINE:",
+      cleanOwnerUid,
+      cleanHomeId,
+      shouldTurnOn ? "ON" : "OFF",
+      reason,
+    );
+
+    return {
+      status: "mqtt_offline",
+      deviceCount: devices.length,
+      successCount: 0,
+      confirmedCount: 0,
+    };
+  }
+
+  let successCount = 0;
+  let confirmedCount = 0;
+
+  for (const { deviceId, device } of devices) {
+    if (shouldTurnOn) {
+      const result = await publishHomeSirenMqtt(
+        deviceId,
+        {
+          alarm: true,
+          volume: normalizeHomeSirenVolume(
+            device.sirenVolume ?? device.volume,
+          ),
+          melody: normalizeHomeSirenMelody(
+            device.sirenMelody ?? device.melody,
+          ),
+          duration: normalizeHomeSirenDuration(
+            device.sirenDuration ?? device.duration,
+          ),
+        },
+      );
+
+      if (result.ok) {
+        successCount++;
+      } else {
+        console.log(
+          "HOME SIREN MQTT COMMAND ERROR:",
+          deviceId,
+          result.error,
+        );
+      }
+
+      continue;
+    }
+
+    let commandAccepted = false;
+    let reportedOff = false;
+
+    for (
+      let attempt = 1;
+      attempt <= HOME_SIREN_STOP_MAX_ATTEMPTS;
+      attempt++
+    ) {
+      const commandStartedAt = Date.now();
+      const result = await publishHomeSirenMqtt(
+        deviceId,
+        { alarm: false },
+      );
+
+      if (!result.ok) {
+        console.log(
+          "HOME SIREN MQTT STOP ERROR:",
+          deviceId,
+          `attempt=${attempt}`,
+          result.error,
+        );
+      } else {
+        commandAccepted = true;
+        reportedOff = await waitForHomeSirenReportedOff(
+          cleanOwnerUid,
+          cleanHomeId,
+          deviceId,
+          commandStartedAt,
+        );
+
+        if (reportedOff) {
+          break;
+        }
+      }
+
+      if (attempt < HOME_SIREN_STOP_MAX_ATTEMPTS) {
+        await waitMs(HOME_SIREN_STOP_RETRY_DELAY_MS);
+      }
+    }
+
+    if (commandAccepted) {
+      successCount++;
+    }
+
+    if (reportedOff) {
+      confirmedCount++;
+    }
+  }
+
+  const allSucceeded = successCount === devices.length;
+  const allConfirmed = confirmedCount === devices.length;
+  const status = allSucceeded
+    ? shouldTurnOn
+      ? "active"
+      : allConfirmed
+        ? "stopped"
+        : "stopped_unconfirmed"
+    : "partial";
+
+  homeSirenRuntimeMap.set(runtimeKey, {
+    desiredOn: shouldTurnOn,
+    deviceSignature,
+    status,
+    lastCommandAt: allSucceeded ? now : 0,
+    confirmedCount,
+    reason,
+    updatedAt: Date.now(),
+  });
+
+  console.log(
+    shouldTurnOn
+      ? "🚨 HOME SIREN ON:"
+      : "🔕 HOME SIREN OFF:",
+    cleanOwnerUid,
+    cleanHomeId,
+    `devices=${successCount}/${devices.length}`,
+    `confirmed=${confirmedCount}/${devices.length}`,
+    reason,
+  );
+
+  return {
+    status,
+    deviceCount: devices.length,
+    successCount,
+    confirmedCount,
+  };
+}
+
+function incidentRequiresPhysicalSiren(incident) {
+  if (!incident || incident.status !== "active") {
+    return false;
+  }
+
+  const requestedStatus = String(
+    incident.homeSirenStatus || "",
+  ).trim();
+
+  if (
+    [
+      "start_requested",
+      "active",
+      "partial",
+      "mqtt_offline",
+      "no_devices",
+    ].includes(requestedStatus)
+  ) {
+    return true;
+  }
+
+  const stage = String(incident.stage || "").trim();
+
+  if (incident.flowType === "emergency") {
+    return stage === "fullscreen_siren" || stage === "calling";
+  }
+
+  return stage === "siren" || stage === "calling";
+}
+
+function collectHomeIncidentKeysInCache(
+  ownerUid,
+  homeId,
+  { requirePhysicalSiren = false } = {},
+) {
+  const cleanOwnerUid = String(ownerUid || "").trim();
+  const cleanHomeId = String(homeId || "").trim();
+  const incidentKeys = new Set();
+
+  for (const [receiverUid, account] of accountCache.entries()) {
+    const incidents = account?.alarmIncidents || {};
+
+    for (const [incidentId, incident] of Object.entries(incidents)) {
+      const belongsToHome =
+        String(incident?.ownerUid || "").trim() === cleanOwnerUid &&
+        String(incident?.homeId || "").trim() === cleanHomeId;
+      const isActive = incident?.status === "active";
+
+      if (
+        belongsToHome &&
+        isActive &&
+        (!requirePhysicalSiren || incidentRequiresPhysicalSiren(incident))
+      ) {
+        incidentKeys.add(
+          getHomeSirenIncidentMuteKey(receiverUid, incidentId),
+        );
+      }
+    }
+  }
+
+  return incidentKeys;
+}
+
+function collectPhysicalSirenDemandKeysInCache(ownerUid, homeId) {
+  return collectHomeIncidentKeysInCache(
+    ownerUid,
+    homeId,
+    { requirePhysicalSiren: true },
+  );
+}
+
+async function collectHomeIncidentKeysInDatabase(
+  ownerUid,
+  homeId,
+  { requirePhysicalSiren = false } = {},
+) {
+  const cleanOwnerUid = String(ownerUid || "").trim();
+  const cleanHomeId = String(homeId || "").trim();
+  const receiverUids = getAlarmReceiverUidsForHome(
+    cleanOwnerUid,
+    cleanHomeId,
+  );
+  const incidentKeys = new Set();
+
+  const snapshots = await Promise.all(
+    receiverUids.map(async (receiverUid) => ({
+      receiverUid,
+      snap: await db
+        .ref(`accounts/${receiverUid}/alarmIncidents`)
+        .once("value"),
+    })),
+  );
+
+  for (const { receiverUid, snap } of snapshots) {
+    const incidents = snap.val() || {};
+
+    for (const [incidentId, incident] of Object.entries(incidents)) {
+      const belongsToHome =
+        String(incident?.ownerUid || "").trim() === cleanOwnerUid &&
+        String(incident?.homeId || "").trim() === cleanHomeId;
+      const isActive = incident?.status === "active";
+
+      if (
+        belongsToHome &&
+        isActive &&
+        (!requirePhysicalSiren || incidentRequiresPhysicalSiren(incident))
+      ) {
+        incidentKeys.add(
+          getHomeSirenIncidentMuteKey(receiverUid, incidentId),
+        );
+      }
+    }
+  }
+
+  return incidentKeys;
+}
+
+async function mutePhysicalSirenForHome(
+  ownerUid,
+  homeId,
+  mutedBy,
+  { reason = "manual_siren_mute" } = {},
+) {
+  const cleanOwnerUid = String(ownerUid || "").trim();
+  const cleanHomeId = String(homeId || "").trim();
+  const now = Date.now();
+
+  if (!cleanOwnerUid || !cleanHomeId) {
+    return {
+      status: "invalid_home",
+      mutedIncidentCount: 0,
+    };
+  }
+
+  // Snapshot toàn bộ incident active của Home, kể cả incident chưa tới cấp còi.
+  // Nhờ vậy vòng leo thang sau đó cũng không bật lại còi của đúng sự cố đã tắt.
+  // Incident mới có ID mới nên vẫn có thể kích hoạt còi trở lại.
+  const activeIncidentKeys = collectHomeIncidentKeysInCache(
+    cleanOwnerUid,
+    cleanHomeId,
+  );
+  const databaseIncidentKeys = await collectHomeIncidentKeysInDatabase(
+    cleanOwnerUid,
+    cleanHomeId,
+  );
+
+  for (const key of databaseIncidentKeys) {
+    activeIncidentKeys.add(key);
+  }
+
+  const mutedIncidentKeys = Object.fromEntries(
+    Array.from(activeIncidentKeys).map((key) => [key, true]),
+  );
+  const muteState = activeIncidentKeys.size > 0
+    ? {
+        active: true,
+        mutedAt: now,
+        mutedBy: String(mutedBy || "").trim(),
+        mutedIncidentKeys,
+      }
+    : null;
+  const runtimeKey = getHomeSirenRuntimeKey(
+    cleanOwnerUid,
+    cleanHomeId,
+  );
+
+  homeSirenManualMuteRuntimeMap.set(runtimeKey, muteState);
+
+  if (muteState) {
+    await db
+      .ref(
+        `accounts/${cleanOwnerUid}/homes/${cleanHomeId}/sirenManualMute`,
+      )
+      .set(muteState);
+  } else {
+    await db
+      .ref(
+        `accounts/${cleanOwnerUid}/homes/${cleanHomeId}/sirenManualMute`,
+      )
+      .remove();
+  }
+
+  const result = await setPhysicalSirenForHome(
+    cleanOwnerUid,
+    cleanHomeId,
+    false,
+    {
+      force: true,
+      reason,
+    },
+  );
+
+  console.log(
+    "🔕 HOME SIREN MANUALLY MUTED:",
+    cleanOwnerUid,
+    cleanHomeId,
+    `incidents=${activeIncidentKeys.size}`,
+    `by=${String(mutedBy || "").trim()}`,
+  );
+
+  return {
+    ...result,
+    mutedIncidentCount: activeIncidentKeys.size,
+  };
+}
+
+async function reconcilePhysicalSirenForHome(
+  ownerUid,
+  homeId,
+  {
+    force = false,
+    useDatabase = false,
+    reason = "siren_reconcile",
+  } = {},
+) {
+  let demandKeys = new Set();
+
+  try {
+    demandKeys = useDatabase
+      ? await collectHomeIncidentKeysInDatabase(
+          ownerUid,
+          homeId,
+          { requirePhysicalSiren: true },
+        )
+      : collectPhysicalSirenDemandKeysInCache(
+          ownerUid,
+          homeId,
+        );
+
+    const manualMute = await getHomeSirenManualMute(
+      ownerUid,
+      homeId,
+      { useDatabase },
+    );
+
+    if (manualMute && demandKeys.size === 0) {
+      // Khi toàn bộ sự cố cũ đã kết thúc, tự bỏ mute để sự cố mới sau này
+      // vẫn có thể kích hoạt còi bình thường.
+      await clearHomeSirenManualMute(ownerUid, homeId);
+    }
+
+    const mutedKeys = new Set(
+      Object.keys(manualMute?.mutedIncidentKeys || {}),
+    );
+    const hasUnmutedDemand = Array.from(demandKeys).some(
+      (key) => !mutedKeys.has(key),
+    );
+
+    await setPhysicalSirenForHome(
+      ownerUid,
+      homeId,
+      hasUnmutedDemand,
+      {
+        force,
+        reason: manualMute && !hasUnmutedDemand
+          ? `${reason}:manual_muted`
+          : reason,
+      },
+    );
+  } catch (error) {
+    console.log(
+      "HOME SIREN RECONCILE READ ERROR:",
+      ownerUid,
+      homeId,
+      error.message,
+    );
+  }
+}
+
+async function requestPhysicalSirenForIncident(
+  receiverUid,
+  incidentId,
+  incident,
+  reason,
+) {
+  const ownerUid = String(
+    incident?.ownerUid || receiverUid,
+  ).trim();
+  const homeId = String(incident?.homeId || "").trim();
+
+  if (!ownerUid || !homeId) {
+    return {
+      status: "invalid_home",
+      deviceCount: 0,
+      successCount: 0,
+    };
+  }
+
+  const incidentRef = db.ref(
+    `accounts/${receiverUid}/alarmIncidents/${incidentId}`,
+  );
+  const now = Date.now();
+
+  // Ghi ý định trước khi publish để backend restart giữa chừng vẫn biết
+  // sự cố này đang yêu cầu còi vật lý.
+  await incidentRef.update({
+    homeSirenStatus: "start_requested",
+    homeSirenRequestedAt: now,
+    updatedAt: now,
+  });
+
+  const manualMute = await getHomeSirenManualMute(
+    ownerUid,
+    homeId,
+    { useDatabase: true },
+  );
+  const incidentMuteKey = getHomeSirenIncidentMuteKey(
+    receiverUid,
+    incidentId,
+  );
+  const isManuallyMuted =
+    manualMute?.mutedIncidentKeys?.[incidentMuteKey] === true;
+
+  let result;
+
+  if (isManuallyMuted) {
+    // Incident này đã được người dùng chủ động tắt còi. Chạy reconcile để
+    // vẫn bật còi nếu Home đồng thời có một incident mới chưa bị mute.
+    await reconcilePhysicalSirenForHome(
+      ownerUid,
+      homeId,
+      {
+        useDatabase: true,
+        reason: `${reason}:manual_muted`,
+      },
+    );
+
+    const devices = await getHomeSirenDevices(ownerUid, homeId);
+    result = {
+      status: "manual_muted",
+      deviceCount: devices.length,
+      successCount: 0,
+    };
+  } else {
+    result = await setPhysicalSirenForHome(
+      ownerUid,
+      homeId,
+      true,
+      { reason },
+    );
+  }
+
+  await incidentRef.update({
+    homeSirenStatus: result.status,
+    homeSirenDeviceCount: result.deviceCount,
+    homeSirenCommandedAt: Date.now(),
+    updatedAt: Date.now(),
+  });
+
+  return result;
+}
+
+function collectCachedHomesWithSiren() {
+  const homes = [];
+
+  for (const [ownerUid, account] of accountCache.entries()) {
+    for (const [homeId, home] of Object.entries(
+      account?.homes || {},
+    )) {
+      if (getHomeSirenDevicesFromHome(home).length > 0) {
+        homes.push({ ownerUid, homeId });
+      }
+    }
+  }
+
+  return homes;
+}
+
+async function reconcileAllPhysicalSirens({
+  force = false,
+  reason = "periodic_reconcile",
+} = {}) {
+  const homes = collectCachedHomesWithSiren();
+
+  for (const { ownerUid, homeId } of homes) {
+    await reconcilePhysicalSirenForHome(
+      ownerUid,
+      homeId,
+      {
+        force,
+        useDatabase: false,
+        reason,
+      },
+    );
+  }
+}
+
+function startPhysicalSirenMonitor() {
+  if (homeSirenReconcileTimer) {
+    return;
+  }
+
+  homeSirenReconcileTimer = setInterval(() => {
+    void reconcileAllPhysicalSirens({
+      reason: "periodic_reconcile",
+    });
+  }, HOME_SIREN_RECONCILE_INTERVAL_MS);
+
+  console.log(
+    "📢 HOME SIREN MONITOR STARTED:",
+    `interval=${HOME_SIREN_RECONCILE_INTERVAL_MS / 1000}s`,
+  );
 }
 
 function isAlarmPauseActiveFromData(pause) {
@@ -2588,13 +4888,12 @@ async function isSecurityIncidentSourceActive({
     item?.alarmSource || "scheduled_alarm",
   ).trim();
 
-  if (
-    receiverAccount?.alarmSettings?.[homeId]?.enabled ===
-    false
-  ) {
+  const homeMode = normalizeHomeSecurityMode(home?.securityMode);
+
+  if (homeMode === "unprotected") {
     return {
       active: false,
-      reason: "alarm_disabled",
+      reason: "home_unprotected",
     };
   }
 
@@ -2697,16 +4996,17 @@ async function evaluateSecurityIncident(
     };
   }
 
-  if (
-    receiverUid !== ownerUid &&
-    receiverAccount &&
-    !receiverAccount?.sharedHomes?.[homeId]
-  ) {
-    return {
-      active: false,
-      items: [],
-      reason: "home_access_removed",
-    };
+  if (receiverUid !== ownerUid) {
+    const sharedMembers =
+      sharedByHomeCache.get(homeId) || {};
+
+    if (!sharedMembers?.[receiverUid]) {
+      return {
+        active: false,
+        items: [],
+        reason: "home_access_removed",
+      };
+    }
   }
 
   let home = homeOverride;
@@ -3137,6 +5437,10 @@ function getOwnedHomeAlarmControlSignature(home) {
     securityMode: normalizeHomeSecurityMode(
       home?.securityMode,
     ),
+    securityModeRepeatMinutes:
+      normalizeSecurityModeRepeatMinutes(
+        home?.securityModeRepeatMinutes,
+      ),
     alarmPauseToday: home?.alarmPauseToday || null,
     alarm: home?.alarm || null,
     scheduleAlarms: home?.schedules?.alarms || null,
@@ -3160,12 +5464,9 @@ function getReceiverHomeAlarmControlSignature(
   }
 
   return JSON.stringify({
-    enabled:
-      account?.alarmSettings?.[homeId]?.enabled ?? null,
-    mode: customHome?.mode || "home",
+    alarmMode:
+      customHome?.alarmMode || customHome?.mode || "home",
     customDeviceAlarms,
-    sharedAlarmEnabled:
-      account?.sharedHomes?.[homeId]?.alarmEnabled ?? null,
   });
 }
 
@@ -3197,6 +5498,23 @@ async function handleAlarmRelevantAccountChange(
           uid,
           homeId,
           "home_alarm_control_changed",
+        );
+      }
+
+      const previousRepeatMinutes =
+        normalizeSecurityModeRepeatMinutes(
+          previousHomes[homeId]?.securityModeRepeatMinutes,
+        );
+      const nextRepeatMinutes =
+        normalizeSecurityModeRepeatMinutes(
+          nextHomes[homeId]?.securityModeRepeatMinutes,
+        );
+
+      if (previousRepeatMinutes !== nextRepeatMinutes) {
+        await syncSecurityModeRepeatForHome(
+          uid,
+          homeId,
+          nextHomes[homeId] || null,
         );
       }
     }
@@ -3413,16 +5731,27 @@ async function sendAlarmStageSummary(
       allowedItems[0]?.ownerUid || "",
     );
 
+    const payloadItems = allowedItems.map((item) => ({
+      ...item,
+      incidentId: String(incidentId || ""),
+      eventCategory: getStandardIncidentEventCategory(flowType),
+      alarmLevel: getStandardIncidentAlarmLevel(flowType),
+    }));
+
     const message = {
       data: {
         type,
         title,
         body,
-        alarmItems: JSON.stringify(allowedItems),
+        alarmItems: JSON.stringify(payloadItems),
         incidentId: String(incidentId || ""),
         receiverUid: String(uid || ""),
         alarmStage: stage,
         alarmFlowType: flowType,
+        incidentSchemaVersion: String(ALARM_INCIDENT_SCHEMA_VERSION),
+        eventCategory: getStandardIncidentEventCategory(flowType),
+        alarmLevel: getStandardIncidentAlarmLevel(flowType),
+        incidentStatus: "active",
         homeId: incidentHomeId,
         ownerUid: incidentOwnerUid,
         clickAction,
@@ -3490,6 +5819,9 @@ async function sendAlarmResolvedPush({
   homeId,
   resolvedBy,
   action,
+  flowType = "security",
+  status = "resolved",
+  hasRemainingActiveIncidents = false,
 }) {
   try {
     await sendPushToUser(
@@ -3501,6 +5833,15 @@ async function sendAlarmResolvedPush({
           homeId: String(homeId || ""),
           resolvedBy: String(resolvedBy || ""),
           action: String(action || "resolved"),
+          resolutionAction: String(action || "resolved"),
+          resolutionType: getIncidentResolutionType(resolvedBy),
+          incidentSchemaVersion: String(ALARM_INCIDENT_SCHEMA_VERSION),
+          eventCategory: getStandardIncidentEventCategory(flowType),
+          alarmLevel: getStandardIncidentAlarmLevel(flowType),
+          incidentStatus: String(status || "resolved"),
+          hasRemainingActiveIncidents: String(
+            hasRemainingActiveIncidents === true,
+          ),
           clickAction: "alarm_RESOLVED",
         },
         android: {
@@ -3707,6 +6048,24 @@ async function advanceAlarmIncidentToStage(
           updatedAt: now,
         });
       } else if (nextStage === "siren") {
+        if (incident.physicalSirenEnabled !== false) {
+          await requestPhysicalSirenForIncident(
+            receiverUid,
+            incidentId,
+            incident,
+            "security_siren_stage",
+          );
+        }
+
+        if (incident.fullscreenEnabled === false) {
+          await incidentRef.update({
+            stage: "siren",
+            sirenSentAt: now,
+            updatedAt: now,
+          });
+          continue;
+        }
+
         const sent = await sendAlarmStageSummary(
           receiverUid,
           items,
@@ -3740,6 +6099,24 @@ async function advanceAlarmIncidentToStage(
       } else if (
         nextStage === "fullscreen_siren"
       ) {
+        if (incident.fullscreenEnabled === false) {
+          await incidentRef.update({
+            stage: "fullscreen_siren",
+            fullscreenSentAt: now,
+            updatedAt: now,
+          });
+          continue;
+        }
+
+        if (incident.physicalSirenEnabled !== false) {
+          await requestPhysicalSirenForIncident(
+            receiverUid,
+            incidentId,
+            incident,
+            "emergency_fullscreen_siren_stage",
+          );
+        }
+
         const sent = await sendAlarmStageSummary(
           receiverUid,
           items,
@@ -3768,9 +6145,6 @@ async function advanceAlarmIncidentToStage(
         await incidentRef.update({
           stage: "fullscreen_siren",
           fullscreenSentAt: now,
-          // Điểm nối cho còi vật lý trong nhà.
-          homeSirenStatus: "waiting_devices",
-          homeSirenRequestedAt: now,
           updatedAt: now,
         });
 
@@ -3908,6 +6282,10 @@ function isEmergencyIncidentItemStillUnsafe(
 
 async function evaluatePersistentEmergencyIncident(
   incident,
+  {
+    homeOverride = null,
+    forceDatabase = false,
+  } = {},
 ) {
   const items = normalizeAlarmIncidentItems(
     incident?.items,
@@ -3931,9 +6309,13 @@ async function evaluatePersistentEmergencyIncident(
     incident?.homeId || "",
   ).trim();
 
-  let home = getCachedHomeData(ownerUid, homeId);
+  let home = homeOverride;
 
-  if (!home && ownerUid && homeId) {
+  if (!home && !forceDatabase) {
+    home = getCachedHomeData(ownerUid, homeId);
+  }
+
+  if ((!home || forceDatabase) && ownerUid && homeId) {
     try {
       const homeSnap = await db
         .ref(`accounts/${ownerUid}/homes/${homeId}`)
@@ -3971,6 +6353,102 @@ async function evaluatePersistentEmergencyIncident(
     activeItems,
     unknownItems,
   };
+}
+
+// Đồng bộ ngay các incident Emergency duy trì (khói/CO/gas/ngập...) khi
+// sensor trở lại an toàn. Nhờ vậy còi vật lý và fullscreen Alarm không phải
+// chờ tới mốc auto-expire 30 phút mới được dừng.
+async function resolveClearedPersistentEmergencyIncidents(
+  ownerUid,
+  homeId,
+  {
+    homeOverride = null,
+    reason = "persistent_emergency_cleared",
+  } = {},
+) {
+  const receiverUids = getAlarmReceiverUidsForHome(
+    ownerUid,
+    homeId,
+  );
+
+  for (const receiverUid of receiverUids) {
+    const incidentsSnap = await db
+      .ref(`accounts/${receiverUid}/alarmIncidents`)
+      .once("value");
+    const incidents = incidentsSnap.val() || {};
+
+    for (const [incidentId, incident] of Object.entries(incidents)) {
+      if (
+        incident?.status !== "active" ||
+        incident?.flowType !== "emergency" ||
+        String(incident?.ownerUid || "").trim() !==
+          String(ownerUid || "").trim() ||
+        String(incident?.homeId || "").trim() !==
+          String(homeId || "").trim()
+      ) {
+        continue;
+      }
+
+      const allItems = normalizeAlarmIncidentItems(
+        incident.items,
+      );
+      const nonPersistentItems = allItems.filter((item) => {
+        return !isPersistentEmergencyIncidentItem(item);
+      });
+      const validation = await evaluatePersistentEmergencyIncident(
+        incident,
+        {
+          homeOverride,
+          forceDatabase: !homeOverride,
+        },
+      );
+
+      if (!validation.hasPersistentItems) {
+        continue;
+      }
+
+      const keptItems = normalizeAlarmIncidentItems([
+        ...nonPersistentItems,
+        ...validation.activeItems,
+        ...validation.unknownItems,
+      ]);
+
+      if (keptItems.length === 0) {
+        await resolveAlarmIncidentForReceiver({
+          receiverUid,
+          incidentId,
+          ownerUid: String(ownerUid || ""),
+          homeId: String(homeId || ""),
+          resolvedBy: "safehome_backend",
+          action: reason,
+        });
+        continue;
+      }
+
+      if (JSON.stringify(keptItems) !== JSON.stringify(allItems)) {
+        const now = Date.now();
+
+        await db
+          .ref(`accounts/${receiverUid}/alarmIncidents/${incidentId}`)
+          .update({
+            items: keptItems,
+            reasons: keptItems.map((item) => item.reason),
+            updatedAt: now,
+          });
+
+        setLocalActiveAlarmIncident(
+          receiverUid,
+          incidentId,
+          {
+            ...incident,
+            items: keptItems,
+            reasons: keptItems.map((item) => item.reason),
+            updatedAt: now,
+          },
+        );
+      }
+    }
+  }
 }
 
 async function expireAlarmIncident(
@@ -4148,7 +6626,26 @@ async function expireAlarmIncident(
 
     // SOS và các event tức thời không có trạng thái duy trì sẽ hết hạn
     // theo thời gian như cũ.
+    const flowType = String(
+      incident.flowType || incident.eventCategory || "emergency",
+    ) === "emergency"
+      ? "emergency"
+      : "security";
     const updates = {
+      [`accounts/${receiverUid}/alarmIncidents/${incidentId}/schemaVersion`]:
+        ALARM_INCIDENT_SCHEMA_VERSION,
+      [`accounts/${receiverUid}/alarmIncidents/${incidentId}/eventCategory`]:
+        getStandardIncidentEventCategory(flowType),
+      [`accounts/${receiverUid}/alarmIncidents/${incidentId}/alarmLevel`]:
+        getStandardIncidentAlarmLevel(flowType),
+      [`accounts/${receiverUid}/alarmIncidents/${incidentId}/severity`]:
+        getLegacyIncidentSeverity(flowType),
+      [`accounts/${receiverUid}/alarmIncidents/${incidentId}/statusReason`]:
+        "auto_expired",
+      [`accounts/${receiverUid}/alarmIncidents/${incidentId}/resolutionAction`]:
+        "auto_expired",
+      [`accounts/${receiverUid}/alarmIncidents/${incidentId}/resolutionType`]:
+        "automatic",
       [`accounts/${receiverUid}/alarmIncidents/${incidentId}/status`]:
         "expired",
       [`accounts/${receiverUid}/alarmIncidents/${incidentId}/stage`]:
@@ -4168,11 +6665,34 @@ async function expireAlarmIncident(
     }
 
     await db.ref().update(updates);
+
+    await reconcilePhysicalSirenForHome(
+      String(incident.ownerUid || receiverUid),
+      String(incident.homeId || ""),
+      {
+        useDatabase: true,
+        reason: "incident_expired",
+      },
+    );
+
     removeLocalActiveAlarmIncident(
       receiverUid,
       targetKey,
     );
+    const hasRemainingActiveIncidents =
+      hasLocalActiveAlarmIncidentForReceiver(receiverUid);
     clearAlarmIncidentTimers(receiverUid, incidentId);
+
+    await sendAlarmResolvedPush({
+      uid: receiverUid,
+      incidentId,
+      homeId: String(incident.homeId || ""),
+      resolvedBy: "safehome_backend",
+      action: "auto_expired",
+      flowType,
+      status: "expired",
+      hasRemainingActiveIncidents,
+    });
 
     console.log(
       "⌛ ALARM INCIDENT EXPIRED:",
@@ -4186,6 +6706,481 @@ async function expireAlarmIncident(
       incidentId,
       err.message,
     );
+  }
+}
+
+
+function getSecurityModeItems(items) {
+  return normalizeAlarmIncidentItems(items).filter((item) => {
+    return String(item.alarmSource || "") === "security_mode";
+  });
+}
+
+function applySecurityModeRepeatToItems(
+  items,
+  repeatMinutes,
+) {
+  const normalizedRepeat =
+    normalizeSecurityModeRepeatMinutes(repeatMinutes);
+  const nextAlarm = getNextAlarmTimeText(normalizedRepeat);
+
+  return normalizeAlarmIncidentItems(items).map((item) => {
+    if (String(item.alarmSource || "") !== "security_mode") {
+      return item;
+    }
+
+    return {
+      ...item,
+      repeatMinutes: normalizedRepeat,
+      nextAlarm,
+    };
+  });
+}
+
+function clearSecurityModeRepeatTimer(
+  receiverUid,
+  incidentId,
+) {
+  const key = getAlarmIncidentTimerKey(
+    receiverUid,
+    incidentId,
+  );
+  const timers = alarmIncidentTimerMap[key];
+
+  if (!timers?.repeat) {
+    return;
+  }
+
+  clearTimeout(timers.repeat);
+  delete timers.repeat;
+
+  if (Object.keys(timers).length === 0) {
+    delete alarmIncidentTimerMap[key];
+  } else {
+    alarmIncidentTimerMap[key] = timers;
+  }
+}
+
+function scheduleSecurityModeRepeatTimer(
+  receiverUid,
+  incidentId,
+  incident,
+) {
+  clearSecurityModeRepeatTimer(receiverUid, incidentId);
+
+  if (
+    !incident ||
+    incident.status !== "active" ||
+    incident.flowType === "emergency" ||
+    getSecurityModeItems(incident.items).length === 0
+  ) {
+    return;
+  }
+
+  const repeatMinutes =
+    normalizeSecurityModeRepeatMinutes(
+      incident.repeatMinutes,
+    );
+  const nextRepeatAt = Number(incident.nextRepeatAt || 0);
+
+  if (repeatMinutes <= 0 || nextRepeatAt <= 0) {
+    return;
+  }
+
+  const key = getAlarmIncidentTimerKey(
+    receiverUid,
+    incidentId,
+  );
+  const timers = alarmIncidentTimerMap[key] || {};
+
+  timers.repeat = setTimeout(
+    () => {
+      void handleSecurityModeRepeatDue(
+        receiverUid,
+        incidentId,
+      );
+    },
+    Math.max(0, nextRepeatAt - Date.now()),
+  );
+
+  alarmIncidentTimerMap[key] = timers;
+}
+
+async function loadHomeForSecurityModeRepeat(
+  ownerUid,
+  homeId,
+  homeOverride = null,
+) {
+  if (homeOverride) {
+    return homeOverride;
+  }
+
+  const cachedHome = getCachedHomeData(ownerUid, homeId);
+
+  if (cachedHome) {
+    return cachedHome;
+  }
+
+  const homeSnap = await db
+    .ref(`accounts/${ownerUid}/homes/${homeId}`)
+    .once("value");
+
+  return homeSnap.val();
+}
+
+async function ensureSecurityModeRepeatForIncident(
+  receiverUid,
+  incidentId,
+  incident,
+  {
+    resetFromNow = false,
+    homeOverride = null,
+    scheduleTimer = true,
+  } = {},
+) {
+  if (
+    !incident ||
+    incident.status !== "active" ||
+    incident.flowType === "emergency"
+  ) {
+    clearSecurityModeRepeatTimer(receiverUid, incidentId);
+    return incident;
+  }
+
+  const securityItems = getSecurityModeItems(incident.items);
+
+  if (securityItems.length === 0) {
+    clearSecurityModeRepeatTimer(receiverUid, incidentId);
+    return incident;
+  }
+
+  const ownerUid = String(
+    incident.ownerUid || receiverUid,
+  ).trim();
+  const homeId = String(incident.homeId || "").trim();
+  const home = await loadHomeForSecurityModeRepeat(
+    ownerUid,
+    homeId,
+    homeOverride,
+  );
+
+  if (!home) {
+    console.log(
+      "SECURITY MODE REPEAT HOME UNAVAILABLE:",
+      receiverUid,
+      incidentId,
+      ownerUid,
+      homeId,
+    );
+    return incident;
+  }
+
+  const modeArmed =
+    normalizeHomeSecurityMode(home.securityMode) === "armed";
+  const repeatMinutes = modeArmed
+    ? normalizeSecurityModeRepeatMinutes(
+        home.securityModeRepeatMinutes,
+      )
+    : 0;
+  const now = Date.now();
+  const currentRepeatMinutes =
+    normalizeSecurityModeRepeatMinutes(
+      incident.repeatMinutes,
+    );
+  const currentNextRepeatAt = Number(
+    incident.nextRepeatAt || 0,
+  );
+  const updatedItems = applySecurityModeRepeatToItems(
+    incident.items,
+    repeatMinutes,
+  );
+
+  let nextRepeatAt = null;
+
+  if (repeatMinutes > 0) {
+    const canKeepCurrentDueAt =
+      !resetFromNow &&
+      currentRepeatMinutes === repeatMinutes &&
+      currentNextRepeatAt > 0;
+
+    nextRepeatAt = canKeepCurrentDueAt
+      ? currentNextRepeatAt
+      : now + repeatMinutes * 60 * 1000;
+  }
+
+  const itemsChanged =
+    JSON.stringify(updatedItems) !==
+    JSON.stringify(normalizeAlarmIncidentItems(incident.items));
+  const repeatChanged =
+    currentRepeatMinutes !== repeatMinutes;
+  const dueAtChanged =
+    Number(currentNextRepeatAt || 0) !==
+    Number(nextRepeatAt || 0);
+  const updateData = {};
+
+  if (itemsChanged) {
+    updateData.items = updatedItems;
+    updateData.reasons = updatedItems.map(
+      (item) => item.reason,
+    );
+  }
+
+  if (repeatChanged || dueAtChanged || resetFromNow) {
+    updateData.repeatMinutes = repeatMinutes;
+    updateData.nextRepeatAt = nextRepeatAt;
+    updateData.repeatConfiguredAt = now;
+  }
+
+  let updatedIncident = {
+    ...incident,
+    items: updatedItems,
+    reasons: updatedItems.map((item) => item.reason),
+    repeatMinutes,
+    nextRepeatAt,
+  };
+
+  if (Object.keys(updateData).length > 0) {
+    updateData.updatedAt = now;
+
+    await db
+      .ref(
+        `accounts/${receiverUid}/alarmIncidents/${incidentId}`,
+      )
+      .update(updateData);
+
+    updatedIncident = {
+      ...updatedIncident,
+      ...updateData,
+    };
+
+    setLocalActiveAlarmIncident(
+      receiverUid,
+      incidentId,
+      updatedIncident,
+    );
+  }
+
+  if (repeatMinutes > 0 && scheduleTimer) {
+    scheduleSecurityModeRepeatTimer(
+      receiverUid,
+      incidentId,
+      updatedIncident,
+    );
+  } else if (repeatMinutes === 0) {
+    clearSecurityModeRepeatTimer(
+      receiverUid,
+      incidentId,
+    );
+  }
+
+  return updatedIncident;
+}
+
+async function syncSecurityModeRepeatForHome(
+  ownerUid,
+  homeId,
+  homeOverride = null,
+) {
+  const receiverUids = getAlarmReceiverUidsForHome(
+    ownerUid,
+    homeId,
+  );
+
+  for (const receiverUid of receiverUids) {
+    try {
+      const active =
+        await loadActiveSecurityIncidentForReceiver(
+          receiverUid,
+          ownerUid,
+          homeId,
+        );
+
+      if (!active) {
+        continue;
+      }
+
+      await ensureSecurityModeRepeatForIncident(
+        receiverUid,
+        active.incidentId,
+        active.incident,
+        {
+          resetFromNow: true,
+          homeOverride,
+        },
+      );
+
+      console.log(
+        "🔁 SECURITY MODE REPEAT UPDATED:",
+        receiverUid,
+        ownerUid,
+        homeId,
+        normalizeSecurityModeRepeatMinutes(
+          homeOverride?.securityModeRepeatMinutes,
+        ),
+      );
+    } catch (error) {
+      console.log(
+        "SECURITY MODE REPEAT SYNC ERROR:",
+        receiverUid,
+        ownerUid,
+        homeId,
+        error.message,
+      );
+    }
+  }
+}
+
+async function handleSecurityModeRepeatDue(
+  receiverUid,
+  incidentId,
+) {
+  const lockKey = `${receiverUid}_${incidentId}`;
+
+  if (securityModeRepeatInProgress.has(lockKey)) {
+    return;
+  }
+
+  securityModeRepeatInProgress.add(lockKey);
+  clearSecurityModeRepeatTimer(receiverUid, incidentId);
+
+  try {
+    const incidentRef = db.ref(
+      `accounts/${receiverUid}/alarmIncidents/${incidentId}`,
+    );
+    const incidentSnap = await incidentRef.once("value");
+    const incident = incidentSnap.val();
+
+    if (!incident || incident.status !== "active") {
+      return;
+    }
+
+    const validation =
+      await validateAndResolveSecurityIncident(
+        receiverUid,
+        incidentId,
+        incident,
+        { reasonHint: "security_mode_repeat" },
+      );
+
+    if (!validation.active) {
+      return;
+    }
+
+    let updatedIncident = {
+      ...incident,
+      items: validation.items,
+      reasons: validation.items.map(
+        (item) => item.reason,
+      ),
+    };
+
+    updatedIncident =
+      await ensureSecurityModeRepeatForIncident(
+        receiverUid,
+        incidentId,
+        updatedIncident,
+        { scheduleTimer: false },
+      );
+
+    const repeatMinutes =
+      normalizeSecurityModeRepeatMinutes(
+        updatedIncident.repeatMinutes,
+      );
+    const nextRepeatAt = Number(
+      updatedIncident.nextRepeatAt || 0,
+    );
+
+    if (repeatMinutes <= 0 || nextRepeatAt <= 0) {
+      return;
+    }
+
+    if (nextRepeatAt > Date.now() + 500) {
+      scheduleSecurityModeRepeatTimer(
+        receiverUid,
+        incidentId,
+        updatedIncident,
+      );
+      return;
+    }
+
+    const repeatedItems = getSecurityModeItems(
+      updatedIncident.items,
+    );
+
+    if (repeatedItems.length === 0) {
+      return;
+    }
+
+    const sent = await sendAlarmStageSummary(
+      receiverUid,
+      repeatedItems,
+      {
+        incidentId,
+        stage: "siren",
+        flowType: "security",
+      },
+    );
+
+    const completedAt = Date.now();
+    const followingRepeatAt =
+      completedAt + repeatMinutes * 60 * 1000;
+    const updateData = {
+      items: applySecurityModeRepeatToItems(
+        updatedIncident.items,
+        repeatMinutes,
+      ),
+      nextRepeatAt: followingRepeatAt,
+      lastRepeatAttemptAt: completedAt,
+      updatedAt: completedAt,
+    };
+
+    updateData.reasons = updateData.items.map(
+      (item) => item.reason,
+    );
+
+    if (sent) {
+      updateData.lastRepeatedAt = completedAt;
+      updateData.repeatCount =
+        Number(updatedIncident.repeatCount || 0) + 1;
+    }
+
+    await incidentRef.update(updateData);
+
+    updatedIncident = {
+      ...updatedIncident,
+      ...updateData,
+    };
+
+    setLocalActiveAlarmIncident(
+      receiverUid,
+      incidentId,
+      updatedIncident,
+    );
+
+    scheduleSecurityModeRepeatTimer(
+      receiverUid,
+      incidentId,
+      updatedIncident,
+    );
+
+    console.log(
+      sent
+        ? "🔁 SECURITY MODE ALARM REPEATED:"
+        : "⚠️ SECURITY MODE REPEAT PUSH FAILED:",
+      receiverUid,
+      incidentId,
+      `minutes=${repeatMinutes}`,
+      `next=${followingRepeatAt}`,
+    );
+  } catch (error) {
+    console.log(
+      "SECURITY MODE REPEAT ERROR:",
+      receiverUid,
+      incidentId,
+      error.message,
+    );
+  } finally {
+    securityModeRepeatInProgress.delete(lockKey);
   }
 }
 
@@ -4232,16 +7227,18 @@ function scheduleAlarmIncidentStages(
     );
 
     alarmIncidentTimerMap[key] = {
-      fullscreenSiren: setTimeout(
-        () => {
-          void advanceAlarmIncidentToStage(
-            receiverUid,
-            incidentId,
-            "fullscreen_siren",
-          );
-        },
-        Math.max(0, fullscreenDueAt - now),
-      ),
+      fullscreenSiren: incident.fullscreenEnabled === false
+        ? null
+        : setTimeout(
+            () => {
+              void advanceAlarmIncidentToStage(
+                receiverUid,
+                incidentId,
+                "fullscreen_siren",
+              );
+            },
+            Math.max(0, fullscreenDueAt - now),
+          ),
       calling: setTimeout(
         () => {
           void advanceAlarmIncidentToStage(
@@ -4292,16 +7289,20 @@ function scheduleAlarmIncidentStages(
       },
       Math.max(0, alarmDueAt - now),
     ),
-    siren: setTimeout(
-      () => {
-        void advanceAlarmIncidentToStage(
-          receiverUid,
-          incidentId,
-          "siren",
-        );
-      },
-      Math.max(0, sirenDueAt - now),
-    ),
+    siren:
+      incident.physicalSirenEnabled === false &&
+      incident.fullscreenEnabled === false
+        ? null
+        : setTimeout(
+            () => {
+              void advanceAlarmIncidentToStage(
+                receiverUid,
+                incidentId,
+                "siren",
+              );
+            },
+            Math.max(0, sirenDueAt - now),
+          ),
     calling: setTimeout(
       () => {
         void advanceAlarmIncidentToStage(
@@ -4322,6 +7323,12 @@ function scheduleAlarmIncidentStages(
       Math.max(0, expireAt - now),
     ),
   };
+
+  scheduleSecurityModeRepeatTimer(
+    receiverUid,
+    incidentId,
+    incident,
+  );
 }
 
 async function startOrMergeAlarmIncidents(uid, items) {
@@ -4461,8 +7468,12 @@ async function startOrMergeAlarmIncidents(uid, items) {
             const repeatedItems = groupedItems.filter((item) => {
               const repeatMinutes =
                 normalizeRepeatMinutes(item.repeatMinutes);
+              const source = String(
+                item.alarmSource || "scheduled_alarm",
+              );
 
               return (
+                source === "scheduled_alarm" &&
                 existingKeys.has(
                   getAlarmIncidentItemIdentity(item),
                 ) &&
@@ -4479,9 +7490,27 @@ async function startOrMergeAlarmIncidents(uid, items) {
               ...groupedItems,
             ]);
             const updateData = {
+              ...buildStandardIncidentFields(
+                flowType,
+                newItems.length > 0
+                  ? "sensor_condition_added"
+                  : "sensor_condition_repeated",
+              ),
               items: mergedItems,
               reasons: mergedItems.map(
                 (item) => item.reason,
+              ),
+              physicalSirenEnabled: mergedItems.some(
+                (item) => item.physicalSirenEnabled !== false,
+              ),
+              fullscreenEnabled: mergedItems.some(
+                (item) => item.fullscreenEnabled !== false,
+              ),
+              triggerDelaySeconds: Math.max(
+                0,
+                ...mergedItems.map(
+                  (item) => Number(item.triggerDelaySeconds || 0),
+                ),
               ),
               updatedAt: now,
             };
@@ -4512,6 +7541,13 @@ async function startOrMergeAlarmIncidents(uid, items) {
               active.incidentId,
               updatedIncident,
             );
+
+            const repeatReadyIncident =
+              await ensureSecurityModeRepeatForIncident(
+                uid,
+                active.incidentId,
+                updatedIncident,
+              );
 
             if (newItems.length > 0) {
               const sent = await sendAlarmStageSummary(
@@ -4560,54 +7596,148 @@ async function startOrMergeAlarmIncidents(uid, items) {
               `new=${newItems.length}`,
               `repeat=${repeatedItems.length}`,
               `items=${mergedItems.length}`,
+              `nextRepeatAt=${Number(repeatReadyIncident?.nextRepeatAt || 0)}`,
             );
 
             return;
           }
 
-          const mayMerge =
+          const existingItems = normalizeAlarmIncidentItems(
+            active.incident.items,
+          );
+          const existingKeys = new Set(
+            existingItems.map(getAlarmIncidentItemIdentity),
+          );
+          const newItems = groupedItems.filter((item) => {
+            return !existingKeys.has(
+              getAlarmIncidentItemIdentity(item),
+            );
+          });
+          const hasPersistentEmergency = [
+            ...existingItems,
+            ...groupedItems,
+          ].some(isPersistentEmergencyIncidentItem);
+          const mayMergeTransientRepeat =
             activeAgeMs >= 0 &&
             activeAgeMs <= EMERGENCY_MERGE_WINDOW_MS;
 
-          if (mayMerge) {
+          // Một trạng thái Emergency duy trì chỉ giữ một incident cho đến khi
+          // sensor trở lại an toàn. Emergency mới từ sensor khác cũng được gộp
+          // vào incident đang chạy. Chỉ một sự kiện transient giống hệt (SOS)
+          // sau merge window mới được coi là lần kích hoạt mới.
+          if (
+            newItems.length > 0 ||
+            hasPersistentEmergency ||
+            mayMergeTransientRepeat
+          ) {
             const mergedItems = normalizeAlarmIncidentItems([
-              ...(Array.isArray(active.incident.items)
-                ? active.incident.items
-                : []),
+              ...existingItems,
               ...groupedItems,
             ]);
+            const updateData = {
+              ...buildStandardIncidentFields(
+                flowType,
+                newItems.length > 0
+                  ? "sensor_condition_added"
+                  : "sensor_condition_repeated",
+              ),
+              items: mergedItems,
+              reasons: mergedItems.map(
+                (item) => item.reason,
+              ),
+              physicalSirenEnabled: mergedItems.some(
+                (item) => item.physicalSirenEnabled !== false,
+              ),
+              fullscreenEnabled: mergedItems.some(
+                (item) => item.fullscreenEnabled !== false,
+              ),
+              triggerDelaySeconds: 0,
+              expireAt:
+                now + ALARM_INCIDENT_AUTO_EXPIRE_MS,
+              lastNewConditionAt:
+                newItems.length > 0
+                  ? now
+                  : Number(
+                      active.incident.lastNewConditionAt ||
+                      active.incident.detectedAt ||
+                      now,
+                    ),
+              updatedAt: now,
+            };
 
             await db
               .ref(
                 `accounts/${uid}/alarmIncidents/${active.incidentId}`,
               )
-              .update({
-                items: mergedItems,
-                reasons: mergedItems.map(
-                  (item) => item.reason,
-                ),
-                updatedAt: now,
-              });
+
+              .update(updateData);
+
+            const updatedIncident = {
+              ...active.incident,
+              ...updateData,
+            };
 
             setLocalActiveAlarmIncident(
               uid,
               active.incidentId,
-              {
-                ...active.incident,
-                items: mergedItems,
-                reasons: mergedItems.map(
-                  (item) => item.reason,
-                ),
-                updatedAt: now,
-              },
+              updatedIncident,
             );
 
-            console.log(
-              "➕ ALARM INCIDENT MERGED:",
+            rescheduleAlarmIncidentExpireTimer(
               uid,
               active.incidentId,
-              flowType,
-              mergedItems.length,
+              updateData.expireAt,
+            );
+
+            if (newItems.length > 0) {
+              const sent = await sendAlarmStageSummary(
+                uid,
+                newItems,
+                {
+                  incidentId: active.incidentId,
+                  stage: "notification",
+                  flowType,
+                },
+              );
+
+              if (!sent) {
+                scheduleInitialAlarmIncidentPushRetry(
+                  uid,
+                  active.incidentId,
+                  "notification",
+                  flowType,
+                );
+              }
+            }
+
+            const currentStage = String(
+              active.incident.stage || "notification",
+            );
+
+            if (
+              updateData.physicalSirenEnabled === true &&
+              (
+                currentStage === "fullscreen_siren" ||
+                currentStage === "calling"
+              )
+            ) {
+              await reconcilePhysicalSirenForHome(
+                ownerUid,
+                homeId,
+                {
+                  useDatabase: true,
+                  reason: "emergency_incident_items_merged",
+                },
+              );
+            }
+
+            console.log(
+              "➕ EMERGENCY INCIDENT UPDATED:",
+              uid,
+              active.incidentId,
+              `new=${newItems.length}`,
+              `items=${mergedItems.length}`,
+              `persistent=${hasPersistentEmergency}`,
             );
 
             return;
@@ -4623,9 +7753,15 @@ async function startOrMergeAlarmIncidents(uid, items) {
               `accounts/${uid}/alarmIncidents/${active.incidentId}`,
             )
             .update({
+              ...buildStandardIncidentFields(
+                flowType,
+                "new_emergency_trigger",
+              ),
               status: "superseded",
               supersededAt: now,
               supersededReason: "new_emergency_trigger",
+              resolutionAction: "new_emergency_trigger",
+              resolutionType: "automatic",
               callStatus:
                 active.incident.callStatus === "not_started"
                   ? "not_started"
@@ -4671,6 +7807,12 @@ async function startOrMergeAlarmIncidents(uid, items) {
           homeId,
           homeName,
           flowType,
+
+          ...buildStandardIncidentFields(
+            flowType,
+            "sensor_triggered",
+          ),
+
           status: "active",
           stage: initialStage,
           items: groupedItems,
@@ -4682,6 +7824,18 @@ async function startOrMergeAlarmIncidents(uid, items) {
             now + ALARM_INCIDENT_AUTO_EXPIRE_MS,
           callStatus: "not_started",
           homeSirenStatus: "not_started",
+          physicalSirenEnabled: groupedItems.some(
+            (item) => item.physicalSirenEnabled !== false,
+          ),
+          fullscreenEnabled: groupedItems.some(
+            (item) => item.fullscreenEnabled !== false,
+          ),
+          triggerDelaySeconds: Math.max(
+            0,
+            ...groupedItems.map(
+              (item) => Number(item.triggerDelaySeconds || 0),
+            ),
+          ),
           createdAt: now,
           updatedAt: now,
         };
@@ -4692,12 +7846,47 @@ async function startOrMergeAlarmIncidents(uid, items) {
           incident.callDueAt =
             now + EMERGENCY_CALL_DELAY_MS;
         } else {
+          const policyDelayMs =
+            Number(incident.triggerDelaySeconds || 0) * 1000;
           incident.alarmDueAt =
-            now + ALARM_INCIDENT_ALARM_DELAY_MS;
+            now + Math.max(
+              ALARM_INCIDENT_ALARM_DELAY_MS,
+              policyDelayMs,
+            );
           incident.sirenDueAt =
-            now + ALARM_INCIDENT_SIREN_DELAY_MS;
+            now + Math.max(
+              ALARM_INCIDENT_SIREN_DELAY_MS,
+              policyDelayMs,
+            );
           incident.callDueAt =
             now + ALARM_INCIDENT_CALL_DELAY_MS;
+
+          const securityItems = getSecurityModeItems(
+            groupedItems,
+          );
+          const currentHome = getCachedHomeData(
+            ownerUid,
+            homeId,
+          );
+          const repeatMinutes = securityItems.length > 0
+            ? normalizeSecurityModeRepeatMinutes(
+                currentHome?.securityModeRepeatMinutes ??
+                securityItems[0].repeatMinutes,
+              )
+            : 0;
+
+          incident.items = applySecurityModeRepeatToItems(
+            groupedItems,
+            repeatMinutes,
+          );
+          incident.reasons = incident.items.map(
+            (item) => item.reason,
+          );
+          incident.repeatMinutes = repeatMinutes;
+          incident.nextRepeatAt = repeatMinutes > 0
+            ? now + repeatMinutes * 60 * 1000
+            : null;
+          incident.repeatConfiguredAt = now;
         }
 
         await db.ref().update({
@@ -4721,9 +7910,11 @@ async function startOrMergeAlarmIncidents(uid, items) {
             ? "emergency_detected"
             : "alarm_detected",
           category: "alarm",
-          severity: flowType === "emergency"
-            ? "critical"
-            : "warning",
+
+          severity: getLegacyIncidentSeverity(flowType),
+          eventCategory: getStandardIncidentEventCategory(flowType),
+          alarmLevel: getStandardIncidentAlarmLevel(flowType),
+
           title: flowType === "emergency"
             ? getEmergencyIncidentTitle(groupedItems)
             : "Phát hiện bất thường",
@@ -4743,7 +7934,7 @@ async function startOrMergeAlarmIncidents(uid, items) {
 
         const initialSent = await sendAlarmStageSummary(
           uid,
-          groupedItems,
+          incident.items,
           {
             incidentId,
             stage: initialStage,
@@ -4812,14 +8003,69 @@ async function resumeActiveAlarmIncidents() {
           continue;
         }
 
-        let resumableIncident = incident;
+        const incidentOwnerUid = String(
+          incident?.ownerUid || uid,
+        ).trim();
+        const incidentHomeId = String(
+          incident?.homeId || "",
+        ).trim();
+        const incidentHome = getCachedHomeData(
+          incidentOwnerUid,
+          incidentHomeId,
+        );
 
-        if (incident?.flowType !== "emergency") {
+        if (incidentHome && isHomeUnprotected(incidentHome)) {
+          await resolveAlarmIncidentForReceiver({
+            receiverUid: uid,
+            incidentId,
+            ownerUid: incidentOwnerUid,
+            homeId: incidentHomeId,
+            resolvedBy: "safehome_backend",
+            action: "home_unprotected",
+          });
+          continue;
+        }
+
+        const resumableFlowType = String(
+          incident?.flowType || incident?.eventCategory || "security",
+        ) === "emergency"
+          ? "emergency"
+          : "security";
+        const standardFields = buildStandardIncidentFields(
+          resumableFlowType,
+          String(incident?.statusReason || "backend_resumed"),
+        );
+        let resumableIncident = {
+          ...incident,
+          flowType: resumableFlowType,
+          ...standardFields,
+        };
+
+        if (
+          Number(incident?.schemaVersion || 0) !==
+            ALARM_INCIDENT_SCHEMA_VERSION ||
+          String(incident?.eventCategory || "") !==
+            standardFields.eventCategory ||
+          String(incident?.alarmLevel || "") !==
+            standardFields.alarmLevel
+        ) {
+          await db
+            .ref(
+              `accounts/${uid}/alarmIncidents/${incidentId}`,
+            )
+            .update({
+              flowType: resumableFlowType,
+              ...standardFields,
+              updatedAt: Date.now(),
+            });
+        }
+
+        if (resumableFlowType !== "emergency") {
           const validation =
             await validateAndResolveSecurityIncident(
               uid,
               incidentId,
-              incident,
+              resumableIncident,
               { reasonHint: "backend_restart_validation" },
             );
 
@@ -4828,9 +8074,19 @@ async function resumeActiveAlarmIncidents() {
           }
 
           resumableIncident = {
-            ...incident,
+            ...resumableIncident,
             items: validation.items,
           };
+        }
+
+        if (resumableIncident.flowType !== "emergency") {
+          resumableIncident =
+            await ensureSecurityModeRepeatForIncident(
+              uid,
+              incidentId,
+              resumableIncident,
+              { scheduleTimer: false },
+            );
         }
 
         setLocalActiveAlarmIncident(
@@ -4906,7 +8162,25 @@ async function resolveAlarmIncidentForReceiver({
   }
 
   const now = Date.now();
+  const flowType = String(
+    incident.flowType || incident.eventCategory || "security",
+  ) === "emergency"
+    ? "emergency"
+    : "security";
+  const resolutionType = getIncidentResolutionType(resolvedBy);
   const updates = {
+    [`accounts/${receiverUid}/alarmIncidents/${incidentId}/schemaVersion`]:
+      ALARM_INCIDENT_SCHEMA_VERSION,
+    [`accounts/${receiverUid}/alarmIncidents/${incidentId}/eventCategory`]:
+      getStandardIncidentEventCategory(flowType),
+    [`accounts/${receiverUid}/alarmIncidents/${incidentId}/alarmLevel`]:
+      getStandardIncidentAlarmLevel(flowType),
+    [`accounts/${receiverUid}/alarmIncidents/${incidentId}/severity`]:
+      getLegacyIncidentSeverity(flowType),
+    [`accounts/${receiverUid}/alarmIncidents/${incidentId}/statusReason`]:
+      String(action || "resolved"),
+    [`accounts/${receiverUid}/alarmIncidents/${incidentId}/resolutionType`]:
+      resolutionType,
     [`accounts/${receiverUid}/alarmIncidents/${incidentId}/status`]:
       "resolved",
     [`accounts/${receiverUid}/alarmIncidents/${incidentId}/stage`]:
@@ -4935,10 +8209,22 @@ async function resolveAlarmIncidentForReceiver({
 
   await db.ref().update(updates);
 
+  await reconcilePhysicalSirenForHome(
+    ownerUid,
+    homeId,
+    {
+      useDatabase: true,
+      reason: `incident_resolved:${action}`,
+    },
+  );
+
   removeLocalActiveAlarmIncident(
     receiverUid,
     targetKey,
   );
+
+  const hasRemainingActiveIncidents =
+    hasLocalActiveAlarmIncidentForReceiver(receiverUid);
 
   clearAlarmIncidentTimers(
     receiverUid,
@@ -4951,6 +8237,9 @@ async function resolveAlarmIncidentForReceiver({
     homeId,
     resolvedBy,
     action,
+    flowType,
+    status: "resolved",
+    hasRemainingActiveIncidents,
   });
 
   console.log(
@@ -4978,6 +8267,12 @@ async function sendAlarmSummary(uid, items) {
 function queueEventAlarm(uid, item) {
   const flowType = getAlarmIncidentFlowType([item]);
 
+  if (!firebaseConnected) {
+    registerOfflineAlarmDemand(uid, item);
+    enqueueOfflineAlarmItem(uid, item);
+    return;
+  }
+
   if (flowType === "emergency") {
     void startOrMergeAlarmIncidents(
       uid,
@@ -4988,6 +8283,8 @@ function queueEventAlarm(uid, item) {
         uid,
         error.message,
       );
+      registerOfflineAlarmDemand(uid, item);
+      enqueueOfflineAlarmItem(uid, item);
     });
 
     return;
@@ -4997,10 +8294,11 @@ function queueEventAlarm(uid, item) {
     pendingEventAlarmMap[uid] = [];
   }
 
+  const itemIdentity = getAlarmIncidentItemIdentity(item);
   const exists = pendingEventAlarmMap[uid].some((oldItem) => {
     return (
-      oldItem.homeId === item.homeId &&
-      oldItem.reason === item.reason
+      getAlarmIncidentItemIdentity(oldItem) ===
+      itemIdentity
     );
   });
 
@@ -5019,7 +8317,28 @@ function queueEventAlarm(uid, item) {
       delete pendingEventAlarmMap[uid];
       delete pendingEventAlarmTimerMap[uid];
 
-      await startOrMergeAlarmIncidents(uid, items);
+      if (!firebaseConnected) {
+        for (const queuedItem of items) {
+          registerOfflineAlarmDemand(uid, queuedItem);
+          enqueueOfflineAlarmItem(uid, queuedItem);
+        }
+        return;
+      }
+
+      try {
+        await startOrMergeAlarmIncidents(uid, items);
+      } catch (error) {
+        console.log(
+          "SECURITY INCIDENT START ERROR:",
+          uid,
+          error.message,
+        );
+
+        for (const queuedItem of items) {
+          registerOfflineAlarmDemand(uid, queuedItem);
+          enqueueOfflineAlarmItem(uid, queuedItem);
+        }
+      }
     },
     1200,
   );
@@ -5185,12 +8504,17 @@ async function checkScheduledNotifications() {
 
         let notifications = [];
 
-        if (source === "shared") {
-          const customSnap = await db
-            .ref(`accounts/${receiverUid}/customRules/${homeId}/notifications/items`)
-            .once("value");
+        const customHomeRules =
+          user.customRules?.[homeId] || {};
+        const reminderMode = String(
+          customHomeRules.reminderMode ||
+          customHomeRules.mode ||
+          "home",
+        );
 
-          const customRaw = customSnap.val() || {};
+        if (source === "shared" && reminderMode === "custom") {
+          const customRaw =
+            customHomeRules.notifications?.items || {};
 
           notifications = Array.isArray(customRaw)
             ? customRaw
@@ -5228,8 +8552,8 @@ async function checkScheduledNotifications() {
               homeName,
               `Nhà bạn đã an toàn, hãy an tâm đi ngủ.
 
-Nếu hôm nay bạn có kế hoạch ra/vào nhà trong thời gian Alarm hoạt động,
-hãy thiết lập "Tạm tắt Alarm hôm nay" để tránh làm phiền các thành viên khác.`,
+Nếu hôm nay bạn có kế hoạch ra/vào nhà trong thời gian Báo động hoạt động,
+hãy thiết lập "Tạm tắt Báo động hôm nay" để tránh làm phiền các thành viên khác.`,
               true,
               "",
               [
@@ -5249,8 +8573,8 @@ hãy thiết lập "Tạm tắt Alarm hôm nay" để tránh làm phiền các t
               homeName,
               `⚠️ Nhà ${homeName} chưa an toàn: ${detail}
 
-Nếu hôm nay bạn có kế hoạch ra/vào nhà trong thời gian Alarm hoạt động,
-hãy thiết lập "Tạm tắt Alarm hôm nay" để tránh làm phiền các thành viên khác.`,
+Nếu hôm nay bạn có kế hoạch ra/vào nhà trong thời gian Báo động hoạt động,
+hãy thiết lập "Tạm tắt Báo động hôm nay" để tránh làm phiền các thành viên khác.`,
               false,
               detail,
               [
@@ -5385,6 +8709,549 @@ function isEmergencyDeviceType(deviceType) {
     deviceType === "flood" ||
     deviceType === "sos"
   );
+}
+
+
+// ================= CENTRAL ALARM ENGINE =================
+// Mọi packet cảm biến được chuẩn hóa thành một quyết định duy nhất trước khi
+// tạo incident. Firebase chỉ lưu/đồng bộ trạng thái; quyết định Alarm nằm ở Hub.
+const SENSOR_EVENT_CATEGORY = Object.freeze({
+  EMERGENCY: "emergency",
+  SECURITY: "security",
+  SYSTEM_WARNING: "system_warning",
+  IGNORE: "ignore",
+});
+
+const SENSOR_EVENT_SEVERITY = Object.freeze({
+  INFO: "info",
+  WARNING: "warning",
+  ALARM: "alarm",
+  EMERGENCY: "emergency",
+});
+
+const ALARM_INCIDENT_SCHEMA_VERSION = 2;
+
+function getStandardIncidentEventCategory(flowType) {
+  return String(flowType || "").trim() === "emergency"
+    ? SENSOR_EVENT_CATEGORY.EMERGENCY
+    : SENSOR_EVENT_CATEGORY.SECURITY;
+}
+
+function getStandardIncidentAlarmLevel(flowType) {
+  return String(flowType || "").trim() === "emergency"
+    ? SENSOR_EVENT_SEVERITY.EMERGENCY
+    : SENSOR_EVENT_SEVERITY.ALARM;
+}
+
+function getLegacyIncidentSeverity(flowType) {
+  return String(flowType || "").trim() === "emergency"
+    ? "critical"
+    : "warning";
+}
+
+function getIncidentResolutionType(resolvedBy) {
+  return String(resolvedBy || "").trim() === "safehome_backend"
+    ? "automatic"
+    : "manual";
+}
+
+function buildStandardIncidentFields(
+  flowType,
+  statusReason = "sensor_triggered",
+) {
+  return {
+    schemaVersion: ALARM_INCIDENT_SCHEMA_VERSION,
+    eventCategory: getStandardIncidentEventCategory(flowType),
+    alarmLevel: getStandardIncidentAlarmLevel(flowType),
+    severity: getLegacyIncidentSeverity(flowType),
+    statusReason: String(statusReason || "sensor_triggered"),
+  };
+}
+
+const DEVICE_ALARM_POLICY_DEFAULTS = Object.freeze({
+  enabled: true,
+  physicalSirenEnabled: true,
+  fullscreenEnabled: true,
+  triggerDelaySeconds: 0,
+});
+
+function normalizeDeviceAlarmPolicy(device, deviceType) {
+  const raw =
+    device?.alarmPolicy &&
+    typeof device.alarmPolicy === "object"
+      ? device.alarmPolicy
+      : {};
+
+  const isEmergency = isEmergencyDeviceType(deviceType);
+  const requestedDelay = Number.parseInt(
+    raw.triggerDelaySeconds ?? 0,
+    10,
+  );
+
+  return {
+    // Cảm biến khẩn cấp luôn tham gia Alarm; người dùng chỉ được chọn
+    // cách cảnh báo bằng còi vật lý và fullscreen.
+    enabled: isEmergency ? true : raw.enabled !== false,
+    physicalSirenEnabled:
+      raw.physicalSirenEnabled !== false,
+    fullscreenEnabled:
+      raw.fullscreenEnabled !== false,
+    // Emergency không được trì hoãn. Security cho phép tối đa 120 giây.
+    triggerDelaySeconds: isEmergency
+      ? 0
+      : Math.min(
+          120,
+          Math.max(
+            0,
+            Number.isFinite(requestedDelay)
+              ? requestedDelay
+              : 0,
+          ),
+        ),
+  };
+}
+
+function getSensorEventCategory(deviceType) {
+  if (isEmergencyDeviceType(deviceType)) {
+    return SENSOR_EVENT_CATEGORY.EMERGENCY;
+  }
+
+  if (isSecurityDeviceType(deviceType)) {
+    return SENSOR_EVENT_CATEGORY.SECURITY;
+  }
+
+  return SENSOR_EVENT_CATEGORY.SYSTEM_WARNING;
+}
+
+function getSensorAlarmEventCode(deviceType, reason) {
+  const normalizedType = String(deviceType || "unknown").trim();
+  const normalizedReason = String(reason || "")
+    .trim()
+    .toLowerCase();
+
+  if (
+    normalizedReason.includes("bị tháo") ||
+    normalizedReason.includes("tamper") ||
+    normalizedReason.includes("cạy")
+  ) {
+    return `${normalizedType}:tamper`;
+  }
+
+  if (normalizedType === "sos") return "sos:pressed";
+  if (normalizedType === "smoke") return "smoke:active";
+  if (normalizedType === "heat") return "heat:active";
+  if (normalizedType === "carbon_monoxide") return "co:active";
+  if (normalizedType === "gas") return "gas:active";
+  if (
+    normalizedType === "water_leak" ||
+    normalizedType === "flood"
+  ) {
+    return "water_leak:active";
+  }
+  if (
+    normalizedType === "door" ||
+    normalizedType === "window" ||
+    normalizedType === "gate"
+  ) {
+    return `${normalizedType}:open`;
+  }
+  if (
+    normalizedType === "door_lock" ||
+    normalizedType === "lock"
+  ) {
+    return `${normalizedType}:unlocked`;
+  }
+  if (
+    normalizedType === "motion" ||
+    normalizedType === "presence"
+  ) {
+    return `${normalizedType}:motion`;
+  }
+  if (normalizedType === "vibration") {
+    return "vibration:detected";
+  }
+  if (normalizedType === "glass_break") {
+    return "glass_break:detected";
+  }
+
+  return `${normalizedType}:${normalizedReason || "trigger"}`;
+}
+
+function getSensorAlarmDebounceMs(deviceType, eventCode) {
+  const normalizedType = String(deviceType || "").trim();
+  const normalizedCode = String(eventCode || "").trim();
+
+  // SOS/action thường gửi lặp nhiều packet cho cùng một lần bấm.
+  if (normalizedType === "sos") return 5 * 1000;
+  if (normalizedType === "glass_break") return 5 * 1000;
+  if (normalizedType === "vibration") return 3 * 1000;
+  if (
+    normalizedType === "motion" ||
+    normalizedType === "presence"
+  ) {
+    return 2 * 1000;
+  }
+
+  // Emergency trạng thái và cửa/khóa chỉ cần chặn packet song song rất ngắn;
+  // lần kích hoạt thật sau khi reset vẫn được nhận gần như ngay lập tức.
+  if (
+    normalizedCode.endsWith(":active") ||
+    normalizedCode.endsWith(":open") ||
+    normalizedCode.endsWith(":unlocked") ||
+    normalizedCode.endsWith(":tamper")
+  ) {
+    return 1000;
+  }
+
+  return 1500;
+}
+
+function cleanupSensorAlarmDebounceMap(now = Date.now()) {
+  if (
+    sensorAlarmEventDebounceMap.size <
+    SENSOR_ALARM_DEBOUNCE_MAX_ENTRIES
+  ) {
+    return;
+  }
+
+  for (const [key, lastAcceptedAt] of
+    sensorAlarmEventDebounceMap.entries()) {
+    if (
+      now - Number(lastAcceptedAt || 0) >
+      SENSOR_ALARM_DEBOUNCE_MAX_AGE_MS
+    ) {
+      sensorAlarmEventDebounceMap.delete(key);
+    }
+  }
+
+  if (
+    sensorAlarmEventDebounceMap.size >
+    SENSOR_ALARM_DEBOUNCE_MAX_ENTRIES
+  ) {
+    const sortedEntries = [
+      ...sensorAlarmEventDebounceMap.entries(),
+    ].sort((a, b) => Number(a[1]) - Number(b[1]));
+    const removeCount =
+      sensorAlarmEventDebounceMap.size -
+      SENSOR_ALARM_DEBOUNCE_MAX_ENTRIES;
+
+    for (const [key] of sortedEntries.slice(0, removeCount)) {
+      sensorAlarmEventDebounceMap.delete(key);
+    }
+  }
+}
+
+function shouldAcceptSensorAlarmTrigger({
+  receiverUid,
+  ownerUid,
+  homeId,
+  deviceId,
+  deviceType,
+  reason,
+}) {
+  const eventCode = getSensorAlarmEventCode(
+    deviceType,
+    reason,
+  );
+  const key = [
+    String(receiverUid || "").trim(),
+    String(ownerUid || "").trim(),
+    String(homeId || "").trim(),
+    String(deviceId || "").trim(),
+    eventCode,
+  ].join("|");
+  const now = Date.now();
+  const debounceMs = getSensorAlarmDebounceMs(
+    deviceType,
+    eventCode,
+  );
+  const lastAcceptedAt = Number(
+    sensorAlarmEventDebounceMap.get(key) || 0,
+  );
+
+  if (
+    lastAcceptedAt > 0 &&
+    now - lastAcceptedAt < debounceMs
+  ) {
+    return false;
+  }
+
+  sensorAlarmEventDebounceMap.set(key, now);
+  cleanupSensorAlarmDebounceMap(now);
+  return true;
+}
+
+function buildAlarmTriggerFromSensorEvent({
+  deviceType,
+  deviceName,
+  oldDevice,
+  updateData,
+}) {
+  const safeOldDevice = oldDevice || {};
+  const safeUpdateData = updateData || {};
+
+  // Emergency: luôn hoạt động, không phụ thuộc Mode Bảo vệ hoặc lịch Alarm.
+  if (deviceType === "smoke") {
+    if (
+      isActiveSignal(safeUpdateData.smoke) &&
+      !isActiveSignal(safeOldDevice.smoke)
+    ) {
+      return {
+        category: SENSOR_EVENT_CATEGORY.EMERGENCY,
+        severity: SENSOR_EVENT_SEVERITY.EMERGENCY,
+        reason: `${deviceName}: Phát hiện khói`,
+      };
+    }
+  }
+
+  if (deviceType === "sos") {
+    if (safeUpdateData.action !== undefined) {
+      return {
+        category: SENSOR_EVENT_CATEGORY.EMERGENCY,
+        severity: SENSOR_EVENT_SEVERITY.EMERGENCY,
+        reason: `${deviceName}: SOS được kích hoạt`,
+      };
+    }
+  }
+
+  if (deviceType === "heat") {
+    const triggered =
+      (
+        isActiveSignal(safeUpdateData.heat) &&
+        !isActiveSignal(safeOldDevice.heat)
+      ) ||
+      (
+        isActiveSignal(safeUpdateData.heat_alarm) &&
+        !isActiveSignal(safeOldDevice.heat_alarm)
+      ) ||
+      (
+        isActiveSignal(
+          safeUpdateData.high_temperature_alarm,
+        ) &&
+        !isActiveSignal(
+          safeOldDevice.high_temperature_alarm,
+        )
+      );
+
+    if (triggered) {
+      return {
+        category: SENSOR_EVENT_CATEGORY.EMERGENCY,
+        severity: SENSOR_EVENT_SEVERITY.EMERGENCY,
+        reason: `${deviceName}: Phát hiện nhiệt độ nguy hiểm`,
+      };
+    }
+  }
+
+  if (deviceType === "carbon_monoxide") {
+    const triggered =
+      (
+        isActiveSignal(
+          safeUpdateData.carbon_monoxide,
+        ) &&
+        !isActiveSignal(
+          safeOldDevice.carbon_monoxide,
+        )
+      ) ||
+      (
+        isActiveSignal(safeUpdateData.co_alarm) &&
+        !isActiveSignal(safeOldDevice.co_alarm)
+      );
+
+    if (triggered) {
+      return {
+        category: SENSOR_EVENT_CATEGORY.EMERGENCY,
+        severity: SENSOR_EVENT_SEVERITY.EMERGENCY,
+        reason: `${deviceName}: Phát hiện khí CO`,
+      };
+    }
+  }
+
+  if (deviceType === "gas") {
+    const triggered =
+      (
+        isActiveSignal(safeUpdateData.gas) &&
+        !isActiveSignal(safeOldDevice.gas)
+      ) ||
+      (
+        isActiveSignal(safeUpdateData.gas_alarm) &&
+        !isActiveSignal(safeOldDevice.gas_alarm)
+      );
+
+    if (triggered) {
+      return {
+        category: SENSOR_EVENT_CATEGORY.EMERGENCY,
+        severity: SENSOR_EVENT_SEVERITY.EMERGENCY,
+        reason: `${deviceName}: Phát hiện rò rỉ gas`,
+      };
+    }
+  }
+
+  if (
+    deviceType === "water_leak" ||
+    deviceType === "flood"
+  ) {
+    const triggered =
+      (
+        isActiveSignal(safeUpdateData.water_leak) &&
+        !isActiveSignal(safeOldDevice.water_leak)
+      ) ||
+      (
+        isActiveSignal(safeUpdateData.leak) &&
+        !isActiveSignal(safeOldDevice.leak)
+      ) ||
+      (
+        isActiveSignal(safeUpdateData.water) &&
+        !isActiveSignal(safeOldDevice.water)
+      );
+
+    if (triggered) {
+      return {
+        category: SENSOR_EVENT_CATEGORY.EMERGENCY,
+        severity: SENSOR_EVENT_SEVERITY.EMERGENCY,
+        reason: `${deviceName}: Phát hiện ngập nước`,
+      };
+    }
+  }
+
+  // Tamper của cảm biến emergency vẫn là sự kiện khẩn cấp như logic cũ.
+  if (
+    isEmergencyDeviceType(deviceType) &&
+    safeUpdateData.tamper === true &&
+    safeOldDevice.tamper !== true
+  ) {
+    return {
+      category: SENSOR_EVENT_CATEGORY.EMERGENCY,
+      severity: SENSOR_EVENT_SEVERITY.EMERGENCY,
+      reason: `${deviceName}: Thiết bị bị tháo`,
+    };
+  }
+
+  // Security: chỉ được phép tạo incident sau khi Alarm Engine xác nhận
+  // Mode Bảo vệ hoặc lịch Alarm đang hoạt động.
+  if (isSecurityDeviceType(deviceType)) {
+    if (
+      safeUpdateData.contact === false &&
+      safeOldDevice.contact !== false
+    ) {
+      return {
+        category: SENSOR_EVENT_CATEGORY.SECURITY,
+        severity: SENSOR_EVENT_SEVERITY.ALARM,
+        reason: `${deviceName}: Cửa mở bất thường`,
+      };
+    }
+
+    if (
+      safeUpdateData.tamper === true &&
+      safeOldDevice.tamper !== true
+    ) {
+      return {
+        category: SENSOR_EVENT_CATEGORY.SECURITY,
+        severity: SENSOR_EVENT_SEVERITY.ALARM,
+        reason: `${deviceName}: Thiết bị bị tháo`,
+      };
+    }
+
+    const motionTriggered =
+      (
+        isActiveSignal(safeUpdateData.occupancy) &&
+        !isActiveSignal(safeOldDevice.occupancy)
+      ) ||
+      (
+        isActiveSignal(safeUpdateData.motion) &&
+        !isActiveSignal(safeOldDevice.motion)
+      ) ||
+      (
+        isActiveSignal(safeUpdateData.presence) &&
+        !isActiveSignal(safeOldDevice.presence)
+      );
+
+    if (
+      (
+        deviceType === "motion" ||
+        deviceType === "presence"
+      ) &&
+      motionTriggered
+    ) {
+      return {
+        category: SENSOR_EVENT_CATEGORY.SECURITY,
+        severity: SENSOR_EVENT_SEVERITY.ALARM,
+        reason: `${deviceName}: Phát hiện chuyển động`,
+      };
+    }
+
+    const vibrationTriggered =
+      deviceType === "vibration" &&
+      (
+        (
+          isActiveSignal(safeUpdateData.vibration) &&
+          !isActiveSignal(safeOldDevice.vibration)
+        ) ||
+        (
+          isVibrationAction(safeUpdateData.action) &&
+          (
+            !isVibrationAction(safeOldDevice.action) ||
+            Date.now() - Number(
+              safeOldDevice.last_vibration_at || 0,
+            ) > VIBRATION_ACTIVE_WINDOW_MS
+          )
+        )
+      );
+
+    if (vibrationTriggered) {
+      return {
+        category: SENSOR_EVENT_CATEGORY.SECURITY,
+        severity: SENSOR_EVENT_SEVERITY.ALARM,
+        reason: `${deviceName}: Phát hiện rung/chấn động`,
+      };
+    }
+
+    const glassBreakTriggered =
+      deviceType === "glass_break" &&
+      (
+        (
+          (
+            isActiveSignal(safeUpdateData.glass_break) ||
+            isActiveSignal(safeUpdateData.broken_glass)
+          ) &&
+          !(
+            isActiveSignal(safeOldDevice.glass_break) ||
+            isActiveSignal(safeOldDevice.broken_glass)
+          )
+        ) ||
+        (
+          isGlassBreakAction(safeUpdateData.action) &&
+          !isGlassBreakAction(safeOldDevice.action)
+        )
+      );
+
+    if (glassBreakTriggered) {
+      return {
+        category: SENSOR_EVENT_CATEGORY.SECURITY,
+        severity: SENSOR_EVENT_SEVERITY.ALARM,
+        reason: `${deviceName}: Phát hiện kính vỡ`,
+      };
+    }
+
+    if (
+      (
+        deviceType === "door_lock" ||
+        deviceType === "lock"
+      ) &&
+      normalizeLockState({
+        ...safeOldDevice,
+        ...safeUpdateData,
+      }) === "unlocked" &&
+      normalizeLockState(safeOldDevice) !== "unlocked"
+    ) {
+      return {
+        category: SENSOR_EVENT_CATEGORY.SECURITY,
+        severity: SENSOR_EVENT_SEVERITY.ALARM,
+        reason: `${deviceName}: Khóa đã mở`,
+      };
+    }
+  }
+
+  return null;
 }
 
 function normalizeRepeatMinutes(value) {
@@ -5613,27 +9480,30 @@ async function resolveDeviceAlarmForReceiver(
       const customHomeRules =
         receiverAccount.customRules?.[homeId] || {};
 
-      mode = String(customHomeRules.mode || "home");
+      mode = String(
+        customHomeRules.alarmMode ||
+        customHomeRules.mode ||
+        "home",
+      );
       customAlarm =
         customHomeRules.devices?.[deviceId]?.alarm || null;
     } else {
-      const modeSnap = await db
+      const customRulesSnap = await db
         .ref(
-          `accounts/${receiverUid}/customRules/${homeId}/mode`,
+          `accounts/${receiverUid}/customRules/${homeId}`,
         )
         .once("value");
 
-      mode = String(modeSnap.val() || "home");
+      const customHomeRules =
+        customRulesSnap.val() || {};
 
-      if (mode === "custom") {
-        const customAlarmSnap = await db
-          .ref(
-            `accounts/${receiverUid}/customRules/${homeId}/devices/${deviceId}/alarm`,
-          )
-          .once("value");
-
-        customAlarm = customAlarmSnap.val();
-      }
+      mode = String(
+        customHomeRules.alarmMode ||
+        customHomeRules.mode ||
+        "home",
+      );
+      customAlarm =
+        customHomeRules.devices?.[deviceId]?.alarm || null;
     }
 
     // Chế độ Riêng tôi chỉ ghi đè sensor đã có cài đặt riêng.
@@ -5705,7 +9575,517 @@ function getUnsafeSecurityReason(
   return "";
 }
 
-async function processScheduleAlarmsForOwner(
+function getOfflineAlarmDemandKey(item) {
+  return [
+    String(item?.ownerUid || "").trim(),
+    String(item?.homeId || "").trim(),
+    String(item?.deviceId || "").trim(),
+    getSensorAlarmEventCode(item?.type, item?.reason),
+  ].join("|");
+}
+
+function getOfflineAlarmDemandExpiry(item, createdAt) {
+  const type = String(item?.type || "").trim();
+
+  if (type === "vibration") {
+    return createdAt + VIBRATION_ACTIVE_WINDOW_MS + 5000;
+  }
+
+  if (
+    type === "sos" ||
+    type === "glass_break" ||
+    type === "motion" ||
+    type === "presence"
+  ) {
+    return createdAt + OFFLINE_TRANSIENT_ALARM_TTL_MS;
+  }
+
+  return createdAt + ALARM_INCIDENT_AUTO_EXPIRE_MS;
+}
+
+function isOfflineAlarmDemandStillUnsafe(demand) {
+  const item = demand?.item || {};
+  const ownerUid = String(item.ownerUid || "").trim();
+  const homeId = String(item.homeId || "").trim();
+  const home = getCachedHomeData(ownerUid, homeId);
+
+  if (!home) {
+    // Không tự ý xóa demand khi snapshot chưa đọc được.
+    return Date.now() < Number(demand.expiresAt || 0);
+  }
+
+  if (Date.now() >= Number(demand.expiresAt || 0)) {
+    return false;
+  }
+
+  if (isHomeUnprotected(home)) {
+    return false;
+  }
+
+  const type = String(item.type || "").trim();
+
+  if (isPersistentEmergencyIncidentItem(item)) {
+    return isEmergencyIncidentItemStillUnsafe(home, item);
+  }
+
+  if (
+    type === "sos" ||
+    type === "glass_break"
+  ) {
+    return true;
+  }
+
+  const device = home?.devices?.[item.deviceId] || {};
+
+  if (isSecurityDeviceType(type)) {
+    return Boolean(
+      getUnsafeSecurityReason(
+        item.deviceName || item.deviceId,
+        type,
+        device,
+      ),
+    );
+  }
+
+  return true;
+}
+
+async function activateOfflineAlarmDemand(demandKey) {
+  offlineAlarmSirenTimerMap.delete(demandKey);
+  const demand = offlineAlarmDemandMap.get(demandKey);
+
+  if (
+    !demand ||
+    firebaseConnected ||
+    demand.item?.physicalSirenEnabled === false ||
+    !isOfflineAlarmDemandStillUnsafe(demand)
+  ) {
+    return;
+  }
+
+  demand.sirenStarted = true;
+  demand.sirenStartedAt = Date.now();
+  offlineAlarmDemandMap.set(demandKey, demand);
+
+  await setPhysicalSirenForHome(
+    demand.item.ownerUid,
+    demand.item.homeId,
+    true,
+    {
+      force: false,
+      reason: "offline_alarm_demand",
+    },
+  );
+}
+
+function registerOfflineAlarmDemand(receiverUid, item) {
+  if (!item?.ownerUid || !item?.homeId || !item?.deviceId) {
+    return;
+  }
+
+  const demandKey = getOfflineAlarmDemandKey(item);
+  const now = Date.now();
+  const flowType = getAlarmIncidentFlowType([item]);
+  const delayMs = flowType === "emergency"
+    ? EMERGENCY_FULLSCREEN_DELAY_MS
+    : Math.max(
+        ALARM_INCIDENT_SIREN_DELAY_MS,
+        Number(item.triggerDelaySeconds || 0) * 1000,
+      );
+  const existing = offlineAlarmDemandMap.get(demandKey);
+  const demand = {
+    ...(existing || {}),
+    receiverUid: String(receiverUid || "").trim(),
+    item,
+    createdAt: Number(existing?.createdAt || now),
+    expiresAt: getOfflineAlarmDemandExpiry(
+      item,
+      Number(existing?.createdAt || now),
+    ),
+    sirenStarted: existing?.sirenStarted === true,
+  };
+
+  offlineAlarmDemandMap.set(demandKey, demand);
+
+  const oldExpiryTimer = offlineAlarmExpiryTimerMap.get(
+    demandKey,
+  );
+
+  if (oldExpiryTimer) {
+    clearTimeout(oldExpiryTimer);
+  }
+
+  const expiryTimer = setTimeout(() => {
+    offlineAlarmExpiryTimerMap.delete(demandKey);
+    void reconcileOfflineAlarmDemandsForHome(
+      item.ownerUid,
+      item.homeId,
+    ).catch((error) => {
+      console.log(
+        "OFFLINE ALARM EXPIRY ERROR:",
+        item.homeId,
+        error.message,
+      );
+    });
+  }, Math.max(100, demand.expiresAt - Date.now() + 100));
+
+  offlineAlarmExpiryTimerMap.set(
+    demandKey,
+    expiryTimer,
+  );
+
+  if (
+    demand.sirenStarted ||
+    offlineAlarmSirenTimerMap.has(demandKey) ||
+    item.physicalSirenEnabled === false
+  ) {
+    return;
+  }
+
+  const timer = setTimeout(() => {
+    void activateOfflineAlarmDemand(demandKey).catch((error) => {
+      console.log(
+        "OFFLINE SIREN START ERROR:",
+        item.homeId,
+        error.message,
+      );
+    });
+  }, delayMs);
+
+  offlineAlarmSirenTimerMap.set(demandKey, timer);
+
+  console.log(
+    "📴 OFFLINE ALARM QUEUED:",
+    item.homeId,
+    item.deviceId,
+    flowType,
+    `sirenIn=${Math.round(delayMs / 1000)}s`,
+  );
+}
+
+async function reconcileOfflineAlarmDemandsForHome(
+  ownerUid,
+  homeId,
+) {
+  const cleanOwnerUid = String(ownerUid || "").trim();
+  const cleanHomeId = String(homeId || "").trim();
+  let activeDemandCount = 0;
+  let hadStartedDemand = false;
+
+  for (const [key, demand] of offlineAlarmDemandMap.entries()) {
+    const item = demand?.item || {};
+
+    if (
+      String(item.ownerUid || "").trim() !== cleanOwnerUid ||
+      String(item.homeId || "").trim() !== cleanHomeId
+    ) {
+      continue;
+    }
+
+    if (isOfflineAlarmDemandStillUnsafe(demand)) {
+      activeDemandCount++;
+      hadStartedDemand =
+        hadStartedDemand || demand.sirenStarted === true;
+      continue;
+    }
+
+    const timer = offlineAlarmSirenTimerMap.get(key);
+
+    if (timer) {
+      clearTimeout(timer);
+      offlineAlarmSirenTimerMap.delete(key);
+    }
+
+    const expiryTimer = offlineAlarmExpiryTimerMap.get(key);
+
+    if (expiryTimer) {
+      clearTimeout(expiryTimer);
+      offlineAlarmExpiryTimerMap.delete(key);
+    }
+
+    hadStartedDemand =
+      hadStartedDemand || demand.sirenStarted === true;
+    offlineAlarmDemandMap.delete(key);
+  }
+
+  if (
+    !firebaseConnected &&
+    activeDemandCount === 0 &&
+    hadStartedDemand
+  ) {
+    await setPhysicalSirenForHome(
+      cleanOwnerUid,
+      cleanHomeId,
+      false,
+      {
+        force: true,
+        reason: "offline_alarm_cleared",
+      },
+    );
+  }
+}
+
+function getCurrentEmergencyReason(
+  deviceName,
+  deviceType,
+  device,
+) {
+  const name = String(deviceName || "Thiết bị").trim();
+
+  if (
+    deviceType === "smoke" &&
+    isActiveSignal(device?.smoke)
+  ) {
+    return `${name}: Phát hiện khói`;
+  }
+
+  if (
+    deviceType === "heat" &&
+    (
+      isActiveSignal(device?.heat) ||
+      isActiveSignal(device?.heat_alarm) ||
+      isActiveSignal(device?.high_temperature_alarm)
+    )
+  ) {
+    return `${name}: Phát hiện nhiệt độ nguy hiểm`;
+  }
+
+  if (
+    deviceType === "carbon_monoxide" &&
+    (
+      isActiveSignal(device?.carbon_monoxide) ||
+      isActiveSignal(device?.co_alarm)
+    )
+  ) {
+    return `${name}: Phát hiện khí CO`;
+  }
+
+  if (
+    deviceType === "gas" &&
+    (
+      isActiveSignal(device?.gas) ||
+      isActiveSignal(device?.gas_alarm)
+    )
+  ) {
+    return `${name}: Phát hiện rò rỉ gas`;
+  }
+
+  if (
+    (
+      deviceType === "water_leak" ||
+      deviceType === "flood"
+    ) &&
+    (
+      isActiveSignal(device?.water_leak) ||
+      isActiveSignal(device?.leak) ||
+      isActiveSignal(device?.water)
+    )
+  ) {
+    return `${name}: Phát hiện ngập nước`;
+  }
+
+  if (deviceType === "sos") {
+    const activeUntil = Number(device?.sos_active_until || 0);
+    const lastTriggered = Number(device?.last_triggered || 0);
+
+    if (
+      activeUntil > Date.now() ||
+      (
+        lastTriggered > 0 &&
+        Date.now() - lastTriggered <
+          OFFLINE_TRANSIENT_ALARM_TTL_MS
+      )
+    ) {
+      return `${name}: SOS được kích hoạt`;
+    }
+  }
+
+  return "";
+}
+
+async function resumeOfflineAlarmDemandsFromSnapshot() {
+  if (firebaseConnected) {
+    return;
+  }
+
+  const accounts = getCachedAccountsObject();
+  let resumed = 0;
+
+  for (const [ownerUid, account] of Object.entries(accounts)) {
+    const homes = account?.homes || {};
+
+    for (const [homeId, home] of Object.entries(homes)) {
+      if (isHomeUnprotected(home)) {
+        continue;
+      }
+
+      const homeName = String(home?.name || homeId);
+      const devices = home?.devices || {};
+      const receiverUids = getAlarmReceiverUidsForHome(
+        ownerUid,
+        homeId,
+      );
+
+      for (const [deviceId, device] of Object.entries(devices)) {
+        const deviceType = String(
+          device?.type || "unknown",
+        ).trim();
+        const deviceName = String(
+          device?.name || deviceId,
+        );
+        const policy = normalizeDeviceAlarmPolicy(
+          device,
+          deviceType,
+        );
+
+        if (policy.enabled !== true) {
+          continue;
+        }
+
+        if (isEmergencyDeviceType(deviceType)) {
+          const reason = getCurrentEmergencyReason(
+            deviceName,
+            deviceType,
+            device,
+          );
+
+          if (!reason) {
+            continue;
+          }
+
+          for (const receiverUid of receiverUids) {
+            const item = {
+              ownerUid,
+              homeId,
+              homeName,
+              deviceId,
+              deviceName,
+              type: deviceType,
+              reason,
+              severity: SENSOR_EVENT_SEVERITY.EMERGENCY,
+              eventCategory: SENSOR_EVENT_CATEGORY.EMERGENCY,
+              alarmLevel: SENSOR_EVENT_SEVERITY.EMERGENCY,
+              repeatMinutes: 0,
+              nextAlarm: "ngay lập tức",
+              alarmSource: "emergency_sensor",
+              physicalSirenEnabled:
+                policy.physicalSirenEnabled,
+              fullscreenEnabled:
+                policy.fullscreenEnabled,
+              triggerDelaySeconds: 0,
+            };
+
+            registerOfflineAlarmDemand(receiverUid, item);
+            enqueueOfflineAlarmItem(receiverUid, item);
+            resumed++;
+          }
+
+          continue;
+        }
+
+        if (!isSecurityDeviceType(deviceType)) {
+          continue;
+        }
+
+        const reason = getUnsafeSecurityReason(
+          deviceName,
+          deviceType,
+          device,
+        );
+
+        if (!reason) {
+          continue;
+        }
+
+        for (const receiverUid of receiverUids) {
+          const receiverAccount = getCachedAccountData(
+            receiverUid,
+          );
+          const deviceAlarm =
+            await resolveDeviceAlarmForReceiver(
+              receiverUid,
+              homeId,
+              deviceId,
+              home,
+              receiverAccount,
+            );
+          const securityModeArmed =
+            normalizeHomeSecurityMode(
+              home.securityMode,
+            ) === "armed";
+          const scheduleArmed =
+            !securityModeArmed &&
+            deviceAlarm?.enabled === true &&
+            isAlarmAllowedToday(deviceAlarm) &&
+            isNowInRange(
+              deviceAlarm.start,
+              deviceAlarm.end,
+            );
+
+          if (!securityModeArmed && !scheduleArmed) {
+            continue;
+          }
+
+          if (
+            scheduleArmed &&
+            !await canReceiveAlarm(
+              receiverUid,
+              homeId,
+              ownerUid,
+              { respectPause: true },
+            )
+          ) {
+            continue;
+          }
+
+          const repeatMinutes = securityModeArmed
+            ? normalizeSecurityModeRepeatMinutes(
+                home.securityModeRepeatMinutes,
+              )
+            : normalizeRepeatMinutes(
+                deviceAlarm?.repeatMinutes,
+              );
+          const item = {
+            ownerUid,
+            homeId,
+            homeName,
+            deviceId,
+            deviceName,
+            type: deviceType,
+            reason,
+            severity: SENSOR_EVENT_SEVERITY.ALARM,
+            eventCategory: SENSOR_EVENT_CATEGORY.SECURITY,
+            alarmLevel: SENSOR_EVENT_SEVERITY.ALARM,
+            repeatMinutes,
+            nextAlarm: getNextAlarmTimeText(repeatMinutes),
+            alarmSource: securityModeArmed
+              ? "security_mode"
+              : "scheduled_alarm",
+            physicalSirenEnabled:
+              policy.physicalSirenEnabled,
+            fullscreenEnabled:
+              policy.fullscreenEnabled,
+            triggerDelaySeconds:
+              policy.triggerDelaySeconds,
+          };
+
+          registerOfflineAlarmDemand(receiverUid, item);
+          enqueueOfflineAlarmItem(receiverUid, item);
+          resumed++;
+        }
+      }
+    }
+  }
+
+  if (resumed > 0) {
+    console.log(
+      "📴 OFFLINE ALARMS RESUMED FROM SNAPSHOT:",
+      resumed,
+    );
+  }
+}
+
+async function processSensorEventThroughAlarmEngine(
   receiverUid,
   ownerUid,
   homeId,
@@ -5716,206 +10096,103 @@ async function processScheduleAlarmsForOwner(
   homeData,
   updateData,
 ) {
+  const normalizedDeviceType = String(
+    deviceType || "unknown",
+  ).trim();
   const oldDevice =
     homeData.devices?.[deviceId] || {};
+  const category = getSensorEventCategory(
+    normalizedDeviceType,
+  );
+  const alarmPolicy = normalizeDeviceAlarmPolicy(
+    oldDevice,
+    normalizedDeviceType,
+  );
 
-  if (
-    !isSecurityDeviceType(deviceType) &&
-    !isEmergencyDeviceType(deviceType)
-  ) {
+  if (category === SENSOR_EVENT_CATEGORY.SYSTEM_WARNING) {
+    // Pin yếu, offline, Hub offline... chỉ tạo cảnh báo hệ thống ở luồng
+    // giám sát sức khỏe; tuyệt đối không đánh thức còi khẩn cấp tại đây.
     return;
   }
 
-  // Khói, SOS, gas và ngập luôn cảnh báo,
-  // không phụ thuộc Mode hoặc lịch của sensor.
-  if (isEmergencyDeviceType(deviceType)) {
-    if (
-      deviceType === "smoke" &&
-      updateData.smoke === true &&
-      oldDevice.smoke !== true
-    ) {
-      queueEventAlarm(receiverUid, {
-        ownerUid,
-        homeId,
-        homeName,
-        deviceId,
-        deviceName,
-        type: deviceType,
-        reason: `${deviceName}: Phát hiện khói`,
-        repeatMinutes: 0,
-        nextAlarm: "ngay lập tức",
-      });
+  const trigger = buildAlarmTriggerFromSensorEvent({
+    deviceType: normalizedDeviceType,
+    deviceName,
+    oldDevice,
+    updateData,
+  });
 
-      return;
+  if (!trigger) {
+    return;
+  }
+
+  if (
+    !shouldAcceptSensorAlarmTrigger({
+      receiverUid,
+      ownerUid,
+      homeId,
+      deviceId,
+      deviceType: normalizedDeviceType,
+      reason: trigger.reason,
+    })
+  ) {
+    console.log(
+      "🧯 SENSOR ALARM PACKET DEBOUNCED:",
+      receiverUid,
+      homeId,
+      deviceId,
+      normalizedDeviceType,
+    );
+    return;
+  }
+
+  const homeMode = normalizeHomeSecurityMode(homeData.securityMode);
+
+  if (homeMode === "unprotected") {
+    await sendUnprotectedSensorNotification(receiverUid, {
+      ownerUid,
+      homeId,
+      homeName,
+      deviceId,
+      deviceName,
+      deviceType: normalizedDeviceType,
+      reason: trigger.reason,
+      eventCategory: trigger.category,
+    });
+    return;
+  }
+
+  if (alarmPolicy.enabled !== true) {
+    return;
+  }
+
+  if (trigger.category === SENSOR_EVENT_CATEGORY.EMERGENCY) {
+    const alarmItem = {
+      ownerUid,
+      homeId,
+      homeName,
+      deviceId,
+      deviceName,
+      type: normalizedDeviceType,
+      reason: trigger.reason,
+      severity: trigger.severity,
+      eventCategory: trigger.category,
+      repeatMinutes: 0,
+      nextAlarm: "ngay lập tức",
+      alarmSource: "emergency_sensor",
+      alarmLevel: trigger.severity,
+      physicalSirenEnabled:
+        alarmPolicy.physicalSirenEnabled,
+      fullscreenEnabled:
+        alarmPolicy.fullscreenEnabled,
+      triggerDelaySeconds: 0,
+    };
+
+    if (!firebaseConnected) {
+      registerOfflineAlarmDemand(receiverUid, alarmItem);
     }
 
-    if (
-      deviceType === "sos" &&
-      updateData.action !== undefined
-    ) {
-      queueEventAlarm(receiverUid, {
-        ownerUid,
-        homeId,
-        homeName,
-        deviceId,
-        deviceName,
-        type: deviceType,
-        reason: `${deviceName}: SOS được kích hoạt`,
-        repeatMinutes: 0,
-        nextAlarm: "ngay lập tức",
-      });
-
-      return;
-    }
-
-    if (
-      deviceType === "heat" &&
-      (
-        (
-          isActiveSignal(updateData.heat) &&
-          !isActiveSignal(oldDevice.heat)
-        ) ||
-        (
-          isActiveSignal(updateData.heat_alarm) &&
-          !isActiveSignal(oldDevice.heat_alarm)
-        ) ||
-        (
-          isActiveSignal(
-            updateData.high_temperature_alarm,
-          ) &&
-          !isActiveSignal(
-            oldDevice.high_temperature_alarm,
-          )
-        )
-      )
-    ) {
-      queueEventAlarm(receiverUid, {
-        ownerUid,
-        homeId,
-        homeName,
-        deviceId,
-        deviceName,
-        type: deviceType,
-        reason: `${deviceName}: Phát hiện nhiệt độ nguy hiểm`,
-        repeatMinutes: 0,
-        nextAlarm: "ngay lập tức",
-      });
-
-      return;
-    }
-
-    if (
-      deviceType === "carbon_monoxide" &&
-      (
-        (
-          isActiveSignal(
-            updateData.carbon_monoxide,
-          ) &&
-          !isActiveSignal(
-            oldDevice.carbon_monoxide,
-          )
-        ) ||
-        (
-          isActiveSignal(updateData.co_alarm) &&
-          !isActiveSignal(oldDevice.co_alarm)
-        )
-      )
-    ) {
-      queueEventAlarm(receiverUid, {
-        ownerUid,
-        homeId,
-        homeName,
-        deviceId,
-        deviceName,
-        type: deviceType,
-        reason: `${deviceName}: Phát hiện khí CO`,
-        repeatMinutes: 0,
-        nextAlarm: "ngay lập tức",
-      });
-
-      return;
-    }
-
-    if (
-      deviceType === "gas" &&
-      (
-        (
-          isActiveSignal(updateData.gas) &&
-          !isActiveSignal(oldDevice.gas)
-        ) ||
-        (
-          isActiveSignal(updateData.gas_alarm) &&
-          !isActiveSignal(oldDevice.gas_alarm)
-        )
-      )
-    ) {
-      queueEventAlarm(receiverUid, {
-        ownerUid,
-        homeId,
-        homeName,
-        deviceId,
-        deviceName,
-        type: deviceType,
-        reason: `${deviceName}: Phát hiện rò rỉ gas`,
-        repeatMinutes: 0,
-        nextAlarm: "ngay lập tức",
-      });
-
-      return;
-    }
-
-    if (
-      (
-        deviceType === "water_leak" ||
-        deviceType === "flood"
-      ) &&
-      (
-        (
-          isActiveSignal(updateData.water_leak) &&
-          !isActiveSignal(oldDevice.water_leak)
-        ) ||
-        (
-          isActiveSignal(updateData.leak) &&
-          !isActiveSignal(oldDevice.leak)
-        ) ||
-        (
-          isActiveSignal(updateData.water) &&
-          !isActiveSignal(oldDevice.water)
-        )
-      )
-    ) {
-      queueEventAlarm(receiverUid, {
-        ownerUid,
-        homeId,
-        homeName,
-        deviceId,
-        deviceName,
-        type: deviceType,
-        reason: `${deviceName}: Phát hiện ngập nước`,
-        repeatMinutes: 0,
-        nextAlarm: "ngay lập tức",
-      });
-
-      return;
-    }
-
-    if (
-      updateData.tamper === true &&
-      oldDevice.tamper !== true
-    ) {
-      queueEventAlarm(receiverUid, {
-        ownerUid,
-        homeId,
-        homeName,
-        deviceId,
-        deviceName,
-        type: deviceType,
-        reason: `${deviceName}: Thiết bị bị tháo`,
-        repeatMinutes: 0,
-        nextAlarm: "ngay lập tức",
-      });
-    }
-
+    queueEventAlarm(receiverUid, alarmItem);
     return;
   }
 
@@ -5925,12 +10202,10 @@ async function processScheduleAlarmsForOwner(
       homeId,
       deviceId,
       homeData,
+      getCachedAccountData(receiverUid),
     );
 
-  const securityModeArmed =
-    normalizeHomeSecurityMode(
-      homeData.securityMode,
-    ) === "armed";
+  const securityModeArmed = homeMode === "armed";
 
   const scheduleArmed =
     !securityModeArmed &&
@@ -5941,16 +10216,13 @@ async function processScheduleAlarmsForOwner(
       deviceAlarm.end,
     );
 
-  // Mode Bảo vệ (thủ công hoặc Auto Away) bảo vệ toàn bộ
-  // sensor an ninh. Khi nhà ở Mode Bình thường, lịch riêng
-  // của từng sensor mới được sử dụng.
+  // Security chỉ hoạt động khi Mode Bảo vệ hoặc lịch của sensor đang bật.
   if (!securityModeArmed && !scheduleArmed) {
     return;
   }
 
-  // Với Alarm theo giờ, phải chặn ngay tại điểm nhận event.
-  // Nếu đợi tới lúc tạo incident thì cửa mở vẫn có thể ghi lastScheduleAlarmMap
-  // hoặc lọt qua một nhịp xử lý realtime trước khi pause được áp dụng.
+  // Pause Today chỉ áp dụng cho Alarm theo lịch. Mode Bảo vệ vẫn giữ nguyên
+  // hành vi hiện tại và được kiểm soát bằng chuyển Mode Bình thường.
   if (scheduleArmed) {
     const canReceiveScheduledAlarm = await canReceiveAlarm(
       receiverUid,
@@ -5972,281 +10244,120 @@ async function processScheduleAlarmsForOwner(
         deviceAlarm?.repeatMinutes,
       );
 
-  const nextAlarm =
-    getNextAlarmTimeText(repeatMinutes);
-
-  function rememberAlarmTrigger() {
-    const alarmKey = securityModeArmed
-      ? getSecurityModeAlarmKey(
-          receiverUid,
-          ownerUid,
-          homeId,
-          deviceId,
-        )
-      : getScheduleAlarmKey(
-          receiverUid,
-          ownerUid,
-          homeId,
-          deviceId,
-          deviceAlarm,
-        );
+  if (!securityModeArmed) {
+    const alarmKey = getScheduleAlarmKey(
+      receiverUid,
+      ownerUid,
+      homeId,
+      deviceId,
+      deviceAlarm,
+    );
 
     lastScheduleAlarmMap[alarmKey] = Date.now();
   }
 
-  if (
-    updateData.contact === false &&
-    oldDevice.contact !== false
-  ) {
-    rememberAlarmTrigger();
+  const alarmItem = {
+    ownerUid,
+    homeId,
+    homeName,
+    deviceId,
+    deviceName,
+    type: normalizedDeviceType,
+    reason: trigger.reason,
+    severity: trigger.severity,
+    eventCategory: trigger.category,
+    repeatMinutes,
+    nextAlarm: getNextAlarmTimeText(repeatMinutes),
+    alarmSource: securityModeArmed
+      ? "security_mode"
+      : "scheduled_alarm",
+    alarmLevel: trigger.severity,
+    physicalSirenEnabled:
+      alarmPolicy.physicalSirenEnabled,
+    fullscreenEnabled:
+      alarmPolicy.fullscreenEnabled,
+    triggerDelaySeconds:
+      alarmPolicy.triggerDelaySeconds,
+  };
 
-    queueEventAlarm(receiverUid, {
-      ownerUid,
-      homeId,
-      homeName,
-      deviceId,
-      deviceName,
-      type: deviceType,
-      reason: `${deviceName}: Cửa mở bất thường`,
-      repeatMinutes,
-      nextAlarm,
-      alarmSource: securityModeArmed
-        ? "security_mode"
-        : "scheduled_alarm",
-    });
-
-    return;
+  if (!firebaseConnected) {
+    registerOfflineAlarmDemand(receiverUid, alarmItem);
   }
 
-  if (
-    updateData.tamper === true &&
-    oldDevice.tamper !== true
-  ) {
-    rememberAlarmTrigger();
+  queueEventAlarm(receiverUid, alarmItem);
+}
 
-    queueEventAlarm(receiverUid, {
-      ownerUid,
-      homeId,
-      homeName,
-      deviceId,
-      deviceName,
-      type: deviceType,
-      reason: `${deviceName}: Thiết bị bị tháo`,
-      repeatMinutes,
-      nextAlarm,
-      alarmSource: securityModeArmed
-        ? "security_mode"
-        : "scheduled_alarm",
-    });
-
-    return;
-  }
-
-  const motionTriggered =
-    (
-      isActiveSignal(updateData.occupancy) &&
-      !isActiveSignal(oldDevice.occupancy)
-    ) ||
-    (
-      isActiveSignal(updateData.motion) &&
-      !isActiveSignal(oldDevice.motion)
-    ) ||
-    (
-      isActiveSignal(updateData.presence) &&
-      !isActiveSignal(oldDevice.presence)
-    );
-
-  if (
-    (
-      deviceType === "motion" ||
-      deviceType === "presence"
-    ) &&
-    motionTriggered
-  ) {
-    rememberAlarmTrigger();
-
-    queueEventAlarm(receiverUid, {
-      ownerUid,
-      homeId,
-      homeName,
-      deviceId,
-      deviceName,
-      type: deviceType,
-      reason: `${deviceName}: Phát hiện chuyển động`,
-      repeatMinutes,
-      nextAlarm,
-      alarmSource: securityModeArmed
-        ? "security_mode"
-        : "scheduled_alarm",
-    });
-
-    return;
-  }
-
-  if (
-    (
-      deviceType === "vibration" ||
-      deviceType === "glass_break"
-    ) &&
-    (
-      isActiveSignal(updateData.vibration) ||
-      updateData.action !== undefined
-    )
-  ) {
-    rememberAlarmTrigger();
-
-    queueEventAlarm(receiverUid, {
-      ownerUid,
-      homeId,
-      homeName,
-      deviceId,
-      deviceName,
-      type: deviceType,
-      reason:
-        deviceType === "glass_break"
-          ? `${deviceName}: Phát hiện kính vỡ`
-          : `${deviceName}: Phát hiện rung/chấn động`,
-      repeatMinutes,
-      nextAlarm,
-      alarmSource: securityModeArmed
-        ? "security_mode"
-        : "scheduled_alarm",
-    });
-
-    return;
-  }
-
-  if (
-    (
-      deviceType === "door_lock" ||
-      deviceType === "lock"
-    ) &&
-    normalizeLockState({
-      ...oldDevice,
-      ...updateData,
-    }) === "unlocked" &&
-    normalizeLockState(oldDevice) !== "unlocked"
-  ) {
-    rememberAlarmTrigger();
-
-    queueEventAlarm(receiverUid, {
-      ownerUid,
-      homeId,
-      homeName,
-      deviceId,
-      deviceName,
-      type: deviceType,
-      reason: `${deviceName}: Khóa đã mở`,
-      repeatMinutes,
-      nextAlarm,
-      alarmSource: securityModeArmed
-        ? "security_mode"
-        : "scheduled_alarm",
-    });
-  }
+// Giữ tên hàm cũ để các luồng CO fast-path và MQTT hiện tại không cần đổi
+// đồng loạt. Mọi lời gọi đều được chuyển qua Alarm Engine trung tâm.
+async function processScheduleAlarmsForOwner(
+  receiverUid,
+  ownerUid,
+  homeId,
+  homeName,
+  deviceId,
+  deviceName,
+  deviceType,
+  homeData,
+  updateData,
+) {
+  return processSensorEventThroughAlarmEngine(
+    receiverUid,
+    ownerUid,
+    homeId,
+    homeName,
+    deviceId,
+    deviceName,
+    deviceType,
+    homeData,
+    updateData,
+  );
 }
 
 async function checkScheduledAlarms() {
-  console.log(
-    "🚨 CHECK PER-DEVICE ALARM / SECURITY MODE",
-  );
+  console.log("🚨 CHECK PER-DEVICE ALARM SCHEDULE");
 
   try {
     const accounts = getCachedAccountsObject();
     const now = Date.now();
     const alarmSummaryByUser = {};
 
-    for (const [receiverUid, receiverAccount] of Object.entries(accounts)) {
-      const ownHomes = receiverAccount?.homes || {};
-      const sharedHomes = receiverAccount?.sharedHomes || {};
-      const homesToCheck = [];
+    for (const [ownerUid, ownerAccount] of Object.entries(accounts)) {
+      const homes = ownerAccount?.homes || {};
 
-      for (const [homeId, home] of Object.entries(ownHomes)) {
-        homesToCheck.push({
-          receiverUid,
-          ownerUid: receiverUid,
-          homeId,
-          home,
-        });
-      }
+      for (const [homeId, home] of Object.entries(homes)) {
+        const homeMode = normalizeHomeSecurityMode(home?.securityMode);
+        const securityModeArmed = homeMode === "armed";
 
-      for (const [homeId, sharedInfo] of Object.entries(sharedHomes)) {
-        const ownerUid = String(
-          sharedInfo?.ownerUid || "",
-        ).trim();
-
-        if (!ownerUid) {
+        // Bảo vệ dùng incident riêng; Không bảo vệ tắt toàn bộ Alarm.
+        if (securityModeArmed || homeMode === "unprotected") {
           continue;
         }
 
-        const sharedHome =
-          accounts[ownerUid]?.homes?.[homeId];
-
-        if (!sharedHome) {
-          continue;
-        }
-
-        homesToCheck.push({
-          receiverUid,
+        const receiverUids = getAlarmReceiverUidsForHome(
           ownerUid,
           homeId,
-          home: sharedHome,
-        });
-      }
-
-      for (const item of homesToCheck) {
-        const {
-          ownerUid,
-          homeId,
-          home,
-        } = item;
-
-        const securityModeArmed =
-          normalizeHomeSecurityMode(
-            home?.securityMode,
-          ) === "armed";
-
-        const securityModeRepeatMinutes =
-          normalizeSecurityModeRepeatMinutes(
-            home?.securityModeRepeatMinutes,
-          );
-
+        );
         const devices = home?.devices || {};
 
-        for (const [deviceId, device] of Object.entries(devices)) {
-          const deviceType = String(
-            device?.type || "door",
-          ).trim();
+        for (const receiverUid of receiverUids) {
+          const receiverAccount = accounts[receiverUid] || {};
 
-          if (!isSecurityDeviceType(deviceType)) {
-            continue;
-          }
+          for (const [deviceId, device] of Object.entries(devices)) {
+            const deviceType = String(
+              device?.type || "door",
+            ).trim();
 
-          const securityModeAlarmKey =
-            getSecurityModeAlarmKey(
-              receiverUid,
-              ownerUid,
-              homeId,
-              deviceId,
-            );
-
-          let alarmKey = "";
-          let repeatMinutes = 0;
-
-          if (securityModeArmed) {
-            repeatMinutes =
-              securityModeRepeatMinutes;
-
-            // 0 nghĩa là chỉ báo một lần theo event hoặc ngay
-            // lúc Mode được bật. Không cần quét lặp định kỳ.
-            if (repeatMinutes === 0) {
+            if (!isSecurityDeviceType(deviceType)) {
               continue;
             }
 
-            alarmKey = securityModeAlarmKey;
-          } else {
             delete lastScheduleAlarmMap[
-              securityModeAlarmKey
+              getSecurityModeAlarmKey(
+                receiverUid,
+                ownerUid,
+                homeId,
+                deviceId,
+              )
             ];
 
             const deviceAlarm =
@@ -6265,7 +10376,7 @@ async function checkScheduledAlarms() {
               continue;
             }
 
-            alarmKey = getScheduleAlarmKey(
+            const alarmKey = getScheduleAlarmKey(
               receiverUid,
               ownerUid,
               homeId,
@@ -6288,88 +10399,93 @@ async function checkScheduledAlarms() {
               continue;
             }
 
-            repeatMinutes =
+            const canReceive = await canReceiveAlarm(
+              receiverUid,
+              homeId,
+              ownerUid,
+              { respectPause: true },
+            );
+
+            if (!canReceive) {
+              continue;
+            }
+
+            const deviceName = String(
+              device?.name || deviceId,
+            );
+            const reason = getUnsafeSecurityReason(
+              deviceName,
+              deviceType,
+              device || {},
+            );
+
+            if (!reason) {
+              delete lastScheduleAlarmMap[alarmKey];
+              continue;
+            }
+
+            const repeatMinutes =
               normalizeRepeatMinutes(
                 deviceAlarm.repeatMinutes,
               );
+            const lastTime =
+              lastScheduleAlarmMap[alarmKey] || 0;
+
+            if (repeatMinutes === 0 && lastTime > 0) {
+              continue;
+            }
+
+            if (
+              repeatMinutes > 0 &&
+              lastTime > 0 &&
+              now - lastTime < repeatMinutes * 60 * 1000
+            ) {
+              continue;
+            }
+
+            lastScheduleAlarmMap[alarmKey] = now;
+
+            if (!alarmSummaryByUser[receiverUid]) {
+              alarmSummaryByUser[receiverUid] = [];
+            }
+
+            alarmSummaryByUser[receiverUid].push({
+              ownerUid,
+              homeId,
+              homeName: home?.name || homeId,
+              deviceId,
+              deviceName,
+              type: deviceType,
+              reason,
+              repeatMinutes,
+              nextAlarm:
+                getNextAlarmTimeText(repeatMinutes),
+              alarmSource: "scheduled_alarm",
+            });
           }
-
-          const canReceive = await canReceiveAlarm(
-            receiverUid,
-            homeId,
-            ownerUid,
-            {
-              respectPause: !securityModeArmed,
-            },
-          );
-
-          if (!canReceive) {
-            continue;
-          }
-
-          const deviceName =
-            String(device?.name || deviceId);
-
-          const reason = getUnsafeSecurityReason(
-            deviceName,
-            deviceType,
-            device || {},
-          );
-
-          if (!reason) {
-            delete lastScheduleAlarmMap[alarmKey];
-            continue;
-          }
-
-          const lastTime =
-            lastScheduleAlarmMap[alarmKey] || 0;
-
-          if (repeatMinutes === 0 && lastTime > 0) {
-            continue;
-          }
-
-          if (
-            repeatMinutes > 0 &&
-            lastTime > 0 &&
-            now - lastTime < repeatMinutes * 60 * 1000
-          ) {
-            continue;
-          }
-
-          lastScheduleAlarmMap[alarmKey] = now;
-
-          if (!alarmSummaryByUser[receiverUid]) {
-            alarmSummaryByUser[receiverUid] = [];
-          }
-
-          alarmSummaryByUser[receiverUid].push({
-            ownerUid,
-            homeId,
-            homeName: home?.name || homeId,
-            deviceId,
-            deviceName,
-            type: deviceType,
-            reason,
-            repeatMinutes,
-            nextAlarm:
-              getNextAlarmTimeText(repeatMinutes),
-            alarmSource: securityModeArmed
-              ? "security_mode"
-              : "scheduled_alarm",
-          });
         }
       }
     }
 
-    for (const [receiverUid, items] of Object.entries(alarmSummaryByUser)) {
-      await startOrMergeAlarmIncidents(
-        receiverUid,
-        items,
-      );
+    for (const [receiverUid, items] of Object.entries(
+      alarmSummaryByUser,
+    )) {
+      try {
+        await startOrMergeAlarmIncidents(
+          receiverUid,
+          items,
+        );
+      } catch (error) {
+        console.log(
+          "SCHEDULED ALARM RECEIVER ERROR:",
+          receiverUid,
+          error.message,
+        );
+      }
     }
   } catch (error) {
     console.log(
-      "PER-DEVICE ALARM / SECURITY MODE ERROR:",
+      "PER-DEVICE ALARM SCHEDULE ERROR:",
       error.message,
     );
   }
@@ -6440,9 +10556,17 @@ function getSecurityModeHomeKey(ownerUid, homeId) {
 }
 
 function normalizeHomeSecurityMode(value) {
-  return String(value || "").trim() === "armed"
-    ? "armed"
-    : "normal";
+  const mode = String(value || "").trim().toLowerCase();
+
+  if (mode === "armed" || mode === "unprotected") {
+    return mode;
+  }
+
+  return "normal";
+}
+
+function isHomeUnprotected(home) {
+  return normalizeHomeSecurityMode(home?.securityMode) === "unprotected";
 }
 
 function detachSecurityModeHomeListener(ownerUid, homeId) {
@@ -6474,15 +10598,9 @@ async function triggerAlarmForUnsafeStateOnArmed(
   securityModeTransitionInProgress.add(transitionKey);
 
   try {
-    const [homeSnap, sharedSnap] = await Promise.all([
-      db
-        .ref(`accounts/${ownerUid}/homes/${homeId}`)
-        .once("value"),
-      db
-        .ref(`sharedByHome/${homeId}`)
-        .once("value"),
-    ]);
-
+    const homeSnap = await db
+      .ref(`accounts/${ownerUid}/homes/${homeId}`)
+      .once("value");
     const home = homeSnap.val();
 
     // Mode có thể đã được đổi ngược về normal trong lúc đang đọc dữ liệu.
@@ -6516,7 +10634,6 @@ async function triggerAlarmForUnsafeStateOnArmed(
       const deviceName = String(
         device.name || deviceId,
       ).trim() || deviceId;
-
       const reason = getUnsafeSecurityReason(
         deviceName,
         deviceType,
@@ -6550,36 +10667,27 @@ async function triggerAlarmForUnsafeStateOnArmed(
       return;
     }
 
-    const receiverUids = new Set([ownerUid]);
-    const sharedMembers = asObject(sharedSnap.val());
-
-    for (const sharedUid of Object.keys(sharedMembers)) {
-      const cleanUid = String(sharedUid || "").trim();
-
-      if (cleanUid) {
-        receiverUids.add(cleanUid);
-      }
-    }
+    const receiverUids = getAlarmReceiverUidsForHome(
+      ownerUid,
+      homeId,
+    );
+    let successfulReceivers = 0;
 
     for (const receiverUid of receiverUids) {
-      await startOrMergeAlarmIncidents(
-        receiverUid,
-        alarmItems,
-      );
-
-      const triggeredAt = Date.now();
-
-      for (const item of alarmItems) {
-        const alarmKey =
-          getSecurityModeAlarmKey(
-            receiverUid,
-            ownerUid,
-            homeId,
-            item.deviceId,
-          );
-
-        lastScheduleAlarmMap[alarmKey] =
-          triggeredAt;
+      try {
+        await startOrMergeAlarmIncidents(
+          receiverUid,
+          alarmItems,
+        );
+        successfulReceivers++;
+      } catch (error) {
+        console.log(
+          "SECURITY MODE RECEIVER ALARM ERROR:",
+          receiverUid,
+          ownerUid,
+          homeId,
+          error.message,
+        );
       }
     }
 
@@ -6588,7 +10696,7 @@ async function triggerAlarmForUnsafeStateOnArmed(
       ownerUid,
       homeId,
       `items=${alarmItems.length}`,
-      `receivers=${receiverUids.size}`,
+      `receivers=${successfulReceivers}/${receiverUids.length}`,
     );
   } catch (error) {
     console.log(
@@ -6599,6 +10707,153 @@ async function triggerAlarmForUnsafeStateOnArmed(
     );
   } finally {
     securityModeTransitionInProgress.delete(transitionKey);
+  }
+}
+
+async function resolveAllAlarmIncidentsForHome(
+  ownerUid,
+  homeId,
+  action = "home_unprotected",
+) {
+  const receiverUids = getAlarmReceiverUidsForHome(ownerUid, homeId);
+  let resolved = 0;
+
+  for (const receiverUid of receiverUids) {
+    try {
+      const incidentsSnap = await db
+        .ref(`accounts/${receiverUid}/alarmIncidents`)
+        .once("value");
+      const incidents = incidentsSnap.val() || {};
+
+      for (const [incidentId, incident] of Object.entries(incidents)) {
+        if (
+          incident?.status !== "active" ||
+          String(incident.ownerUid || "") !== String(ownerUid) ||
+          String(incident.homeId || "") !== String(homeId)
+        ) {
+          continue;
+        }
+
+        const didResolve = await resolveAlarmIncidentForReceiver({
+          receiverUid,
+          incidentId,
+          ownerUid,
+          homeId,
+          resolvedBy: "safehome_backend",
+          action,
+        });
+
+        if (didResolve) {
+          resolved++;
+        }
+      }
+    } catch (error) {
+      console.log(
+        "UNPROTECTED INCIDENT RESOLVE ERROR:",
+        receiverUid,
+        ownerUid,
+        homeId,
+        error.message,
+      );
+    }
+  }
+
+  for (const [key, demand] of Array.from(offlineAlarmDemandMap.entries())) {
+    const item = demand?.item || {};
+
+    if (
+      String(item.ownerUid || "") === String(ownerUid) &&
+      String(item.homeId || "") === String(homeId)
+    ) {
+      clearOfflineAlarmDemand(key);
+    }
+  }
+
+  await setPhysicalSirenForHome(ownerUid, homeId, false, {
+    force: true,
+    reason: action,
+  });
+
+  console.log(
+    "🛡️ HOME UNPROTECTED, ALARMS RESOLVED:",
+    ownerUid,
+    homeId,
+    `incidents=${resolved}`,
+  );
+}
+
+async function triggerEmergencyForCurrentUnsafeState(
+  ownerUid,
+  homeId,
+) {
+  try {
+    const homeSnap = await db
+      .ref(`accounts/${ownerUid}/homes/${homeId}`)
+      .once("value");
+    const home = homeSnap.val();
+
+    if (!home || isHomeUnprotected(home)) {
+      return;
+    }
+
+    const homeName = String(home.name || homeId).trim() || homeId;
+    const items = [];
+
+    for (const [deviceId, rawDevice] of Object.entries(home.devices || {})) {
+      const device = rawDevice || {};
+      const deviceType = String(device.type || "unknown").trim();
+
+      if (!isEmergencyDeviceType(deviceType)) {
+        continue;
+      }
+
+      const deviceName = String(device.name || deviceId).trim() || deviceId;
+      const reason = getCurrentEmergencyReason(
+        deviceName,
+        deviceType,
+        device,
+      );
+
+      if (!reason) {
+        continue;
+      }
+
+      const policy = normalizeDeviceAlarmPolicy(device, deviceType);
+
+      items.push({
+        ownerUid,
+        homeId,
+        homeName,
+        deviceId,
+        deviceName,
+        type: deviceType,
+        reason,
+        severity: SENSOR_EVENT_SEVERITY.EMERGENCY,
+        eventCategory: SENSOR_EVENT_CATEGORY.EMERGENCY,
+        alarmLevel: SENSOR_EVENT_SEVERITY.EMERGENCY,
+        repeatMinutes: 0,
+        nextAlarm: "ngay lập tức",
+        alarmSource: "emergency_sensor",
+        physicalSirenEnabled: policy.physicalSirenEnabled,
+        fullscreenEnabled: policy.fullscreenEnabled,
+        triggerDelaySeconds: 0,
+      });
+    }
+
+    if (items.length === 0) {
+      return;
+    }
+
+    for (const receiverUid of getAlarmReceiverUidsForHome(ownerUid, homeId)) {
+      await startOrMergeAlarmIncidents(receiverUid, items);
+    }
+  } catch (error) {
+    console.log(
+      "MODE CHANGE EMERGENCY RECHECK ERROR:",
+      ownerUid,
+      homeId,
+      error.message,
+    );
   }
 }
 
@@ -6630,7 +10885,19 @@ function attachSecurityModeHomeListener(ownerUid, homeId) {
             ownerUid,
             homeId,
           );
+          void triggerEmergencyForCurrentUnsafeState(
+            ownerUid,
+            homeId,
+          );
         }, 1000);
+      } else if (nextMode === "unprotected") {
+        setTimeout(() => {
+          void resolveAllAlarmIncidentsForHome(
+            ownerUid,
+            homeId,
+            "home_unprotected",
+          );
+        }, 200);
       }
 
       return;
@@ -6639,23 +10906,23 @@ function attachSecurityModeHomeListener(ownerUid, homeId) {
     const previousMode = securityModeLastValueMap.get(key);
     securityModeLastValueMap.set(key, nextMode);
 
-    if (
-      previousMode !== "armed" &&
-      nextMode === "armed"
-    ) {
-      void triggerAlarmForUnsafeStateOnArmed(
+    if (nextMode === "unprotected") {
+      void resolveAllAlarmIncidentsForHome(
         ownerUid,
         homeId,
+        "home_unprotected",
       );
       return;
     }
 
-    if (
-      previousMode === "armed" &&
-      nextMode === "normal"
-    ) {
-      const cachedHome =
-        getCachedHomeData(ownerUid, homeId) || {};
+    if (nextMode === "armed" && previousMode !== "armed") {
+      void triggerAlarmForUnsafeStateOnArmed(ownerUid, homeId);
+      void triggerEmergencyForCurrentUnsafeState(ownerUid, homeId);
+      return;
+    }
+
+    if (nextMode === "normal") {
+      const cachedHome = getCachedHomeData(ownerUid, homeId) || {};
 
       void validateSecurityIncidentsForHome(
         ownerUid,
@@ -6668,6 +10935,10 @@ function attachSecurityModeHomeListener(ownerUid, homeId) {
           },
         },
       );
+
+      if (previousMode === "unprotected") {
+        void triggerEmergencyForCurrentUnsafeState(ownerUid, homeId);
+      }
     }
   };
 
@@ -6756,10 +11027,29 @@ async function startSecurityModeTransitionMonitor() {
       const key = getSecurityModeHomeKey(ownerUid, homeId);
       const home = asObject(rawHome);
 
+      const currentMode = normalizeHomeSecurityMode(
+        home.securityMode,
+      );
+
       securityModeLastValueMap.set(
         key,
-        normalizeHomeSecurityMode(home.securityMode),
+        currentMode,
       );
+
+      if (currentMode === "armed") {
+        setTimeout(() => {
+          void triggerAlarmForUnsafeStateOnArmed(ownerUid, homeId);
+          void triggerEmergencyForCurrentUnsafeState(ownerUid, homeId);
+        }, 1000);
+      } else if (currentMode === "unprotected") {
+        setTimeout(() => {
+          void resolveAllAlarmIncidentsForHome(
+            ownerUid,
+            homeId,
+            "home_unprotected",
+          );
+        }, 200);
+      }
     }
 
     attachSecurityModeAccountListener(ownerUid);
@@ -7867,6 +12157,27 @@ async function checkAutoAwayHomes(db) {
           home.securityModeSource || "",
         ).trim();
 
+        // Không bảo vệ là khóa ưu tiên tuyệt đối. Auto Away không được
+        // tự bật Bảo vệ hoặc thay đổi mode này.
+        if (securityMode === "unprotected") {
+          const nextRuntime = buildRuntime({
+            status: "unprotected_override",
+            ...runtimeCounts,
+            allOutsideSince: 0,
+            cycleArmed: false,
+            manualNormalSnoozeUntil: 0,
+            insideOverrideUid: "",
+            insideOverrideAt: 0,
+            now,
+          });
+
+          if (runtimeSignature(runtime) !== runtimeSignature(nextRuntime)) {
+            updates[runtimePath] = nextRuntime;
+          }
+
+          continue;
+        }
+
         // Bật Bảo vệ thủ công là khóa ưu tiên cao nhất:
         // Auto Away không được tự hạ về Bình thường và không ghi đè
         // nguồn manual khi user đã chủ động bật Bảo vệ.
@@ -8838,39 +13149,289 @@ async function sendChatNotificationPush({
 }
 
 // ================= INIT =================
+function awaitWithTimeout(promise, timeoutMs, label) {
+  let timeout;
+
+  const timeoutPromise = new Promise((_, reject) => {
+    timeout = setTimeout(() => {
+      reject(new Error(`${label}_timeout`));
+    }, timeoutMs);
+  });
+
+  return Promise.race([promise, timeoutPromise])
+    .finally(() => {
+      clearTimeout(timeout);
+    });
+}
+
+async function runCloudInitStep(
+  label,
+  task,
+  timeoutMs = 2 * 1000,
+) {
+  try {
+    await awaitWithTimeout(
+      Promise.resolve().then(task),
+      timeoutMs,
+      label,
+    );
+  } catch (error) {
+    console.log(`${label} DEFERRED:`, error.message);
+  }
+}
+
 async function init() {
-  await startBackendDataCache();
-  await db.ref("pair_requests").remove();
-  console.log("🧹 OLD PAIR REQUESTS CLEARED");
+  loadLocalRuntimeState();
+  startFirebaseConnectionMonitor();
+  startOfflineQueueFlushTimer();
 
-  await cleanupLegacySecurityScheduleState();
+  await runCloudInitStep(
+    "BACKEND DATA CACHE",
+    startBackendDataCache,
+    5 * 1000,
+  );
 
-  // Chuyển số tin chưa đọc cũ sang counter nhỏ theo từng tài khoản/nhà.
-  // Marker đảm bảo chỉ quét lịch sử Home Chat đúng một lần.
-  await ensureChatUnreadCounterMigration();
+  if (!firebaseConnected) {
+    await resumeOfflineAlarmDemandsFromSnapshot();
+  }
 
-  // Khôi phục các sự cố Alarm chưa được xử lý sau khi backend restart.
-  await resumeActiveAlarmIncidents();
+  await runCloudInitStep(
+    "OLD PAIR REQUEST CLEANUP",
+    async () => {
+      await db.ref("pair_requests").remove();
+      console.log("🧹 OLD PAIR REQUESTS CLEARED");
+    },
+  );
 
-  // Watchdog thưa 60 giây, chỉ dùng cache để dọn incident bị bỏ sót.
+  await runCloudInitStep(
+    "LEGACY SECURITY SCHEDULE CLEANUP",
+    cleanupLegacySecurityScheduleState,
+  );
+
+  await runCloudInitStep(
+    "CHAT UNREAD MIGRATION",
+    ensureChatUnreadCounterMigration,
+  );
+
+  await runCloudInitStep(
+    "ACTIVE ALARM RESUME",
+    resumeActiveAlarmIncidents,
+  );
+
+  await runCloudInitStep(
+    "PHYSICAL SIREN STARTUP RECONCILE",
+    async () => {
+      await reconcileAllPhysicalSirens({
+        force: true,
+        reason: "backend_startup",
+      });
+    },
+  );
+
+  startPhysicalSirenMonitor();
   startAlarmIncidentWatchdog();
 
-  // Khi mode chuyển normal -> armed, kiểm tra ngay trạng thái sensor hiện tại.
-  await startSecurityModeTransitionMonitor();
+  await runCloudInitStep(
+    "SECURITY MODE MONITOR",
+    startSecurityModeTransitionMonitor,
+  );
 
-  // Tự động chuyển Mode khi toàn bộ thành viên rời nhà.
-  startAutoAwayMonitor({ db });
+  try {
+    startAutoAwayMonitor({ db });
+  } catch (error) {
+    console.log(
+      "AUTO AWAY MONITOR START ERROR:",
+      error.message,
+    );
+  }
 
-  // Ghi nhịp sống của Raspberry Pi/backend lên Firebase.
   startHubHeartbeat();
+  startSystemHealthMonitor();
 
   setInterval(cleanupExpiredAlarmPause, 60000);
   setInterval(checkScheduledNotifications, 60000);
+  setInterval(() => {
+    if (firebaseConnected) {
+      void checkScheduledAlarms();
+      return;
+    }
 
-  // Kiểm tra lịch Alarm riêng của từng sensor.
-  setInterval(checkScheduledAlarms, 60000);
+    void resumeOfflineAlarmDemandsFromSnapshot().catch((error) => {
+      console.log(
+        "OFFLINE SCHEDULE CHECK ERROR:",
+        error.message,
+      );
+    });
+  }, 60000);
+
+  console.log(
+    "🛡️ SAFEHOME BACKEND READY:",
+    firebaseConnected ? "cloud" : "offline_local",
+  );
 }
+
+init().catch((error) => {
+  console.log("BACKEND INIT ERROR:", error.message);
+});
+
+function persistRuntimeBeforeExit(signal) {
+  try {
+    if (localRuntimeSnapshotSaveTimer) {
+      clearTimeout(localRuntimeSnapshotSaveTimer);
+      localRuntimeSnapshotSaveTimer = null;
+    }
+
+    if (offlineQueueSaveTimer) {
+      clearTimeout(offlineQueueSaveTimer);
+      offlineQueueSaveTimer = null;
+    }
+
+    persistLocalRuntimeSnapshotNow();
+    persistOfflineQueueNow();
+  } finally {
+    console.log("💾 LOCAL RUNTIME SAVED:", signal);
+  }
+}
+
+process.once("SIGTERM", () => {
+  persistRuntimeBeforeExit("SIGTERM");
+  process.exit(0);
+});
+
+process.once("SIGINT", () => {
+  persistRuntimeBeforeExit("SIGINT");
+  process.exit(0);
+});
 const deviceDeleteInProgress = new Set();
+
+db.ref("device_delete_requests").on("child_added", async (snap) => {
+  const requestId = String(snap.key || "").trim();
+  const req = snap.val() || {};
+
+  if (!requestId || req.status !== "pending") {
+    return;
+  }
+
+  const ownerUid = String(req.ownerUid || "").trim();
+  const homeId = String(req.homeId || "").trim();
+  const deviceId = String(req.deviceId || "").trim();
+  const requestedBy = String(req.requestedBy || "").trim();
+  const operationKey = `${ownerUid}|${homeId}|${deviceId}`;
+
+  if (deviceDeleteInProgress.has(operationKey)) {
+    return;
+  }
+
+  deviceDeleteInProgress.add(operationKey);
+
+  try {
+    if (!ownerUid || !homeId || !deviceId || !requestedBy) {
+      console.log(
+        "❌ DEVICE DELETE REQUEST INVALID:",
+        requestId,
+      );
+
+      await snap.ref.remove();
+      return;
+    }
+
+    const deviceRef = db.ref(
+      `accounts/${ownerUid}/homes/${homeId}/devices/${deviceId}`,
+    );
+
+    const deviceSnap = await deviceRef.once("value");
+
+    if (!deviceSnap.exists()) {
+      await db.ref().update({
+        [`system/devices_by_ieee/${deviceId}`]: null,
+        [`device_delete_requests/${requestId}`]: null,
+      });
+
+      delete deviceMap[deviceId];
+
+      console.log(
+        "🧹 DEVICE ALREADY REMOVED:",
+        deviceId,
+      );
+      return;
+    }
+
+    console.log(
+      "🗑️ DELETE DEVICE:",
+      deviceId,
+      `owner=${ownerUid}`,
+      `requestedBy=${requestedBy}`,
+    );
+
+    await new Promise((resolve, reject) => {
+      client.publish(
+        "zigbee2mqtt/bridge/request/device/remove",
+        JSON.stringify({
+          id: deviceId,
+          force: true,
+        }),
+        (error) => {
+          if (error) {
+            reject(error);
+            return;
+          }
+
+          resolve();
+        },
+      );
+    });
+
+    // Cho Zigbee2MQTT đủ thời gian xoá thiết bị trước khi dọn Firebase.
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+
+    const updates = {
+      [`accounts/${ownerUid}/homes/${homeId}/devices/${deviceId}`]: null,
+      [`system/devices_by_ieee/${deviceId}`]: null,
+      [`device_delete_requests/${requestId}`]: null,
+    };
+
+    // Dọn cấu hình Alarm riêng còn sót của Owner và các thành viên.
+    const affectedUids = new Set([ownerUid]);
+    const sharedMembers = sharedByHomeCache.get(homeId) || {};
+
+    for (const sharedUid of Object.keys(sharedMembers)) {
+      const cleanUid = String(sharedUid || "").trim();
+
+      if (cleanUid) {
+        affectedUids.add(cleanUid);
+      }
+    }
+
+    for (const affectedUid of affectedUids) {
+      updates[
+        `accounts/${affectedUid}/customRules/${homeId}/devices/${deviceId}`
+      ] = null;
+    }
+
+    await db.ref().update(updates);
+
+    delete deviceMap[deviceId];
+
+    console.log(
+      "✅ DEVICE REMOVED:",
+      deviceId,
+      `request=${requestId}`,
+    );
+  } catch (error) {
+    console.log(
+      "DELETE DEVICE ERROR:",
+      requestId,
+      error.message,
+    );
+
+    // Xoá request lỗi để người dùng có thể gửi lại ngay.
+    try {
+      await snap.ref.remove();
+    } catch (_) {}
+  } finally {
+    deviceDeleteInProgress.delete(operationKey);
+  }
+});
 
 const homeNotificationRequestInProgress = new Set();
 const lastHomeNotificationRequestMap = {};
@@ -10427,7 +14988,7 @@ db.ref("accounts").on("child_changed", async (snap) => {
           : "Một thành viên";
 
       const text =
-        `Alarm đã được ${actorName} tạm tắt từ ${pause.start} tới ${pause.end}.
+        `Báo động đã được ${actorName} tạm tắt từ ${pause.start} tới ${pause.end}.
 
 Nên trong khoảng thời gian này:
 • Một số thiết bị an ninh sẽ tạm ngừng cảnh báo.
@@ -10448,7 +15009,7 @@ Nên trong khoảng thời gian này:
         String(pause.reason || "").trim();
 
       const homeNotificationMessage =
-        `${actorName} đã tạm dừng Alarm từ ${pause.start} đến ${pause.end}.` +
+        `${actorName} đã tạm dừng Báo động từ ${pause.start} đến ${pause.end}.` +
         (
           pauseReason.length > 0
             ? ` Lý do: ${pauseReason}.`
@@ -10463,7 +15024,7 @@ Nên trong khoảng thời gian này:
           type: "alarm_pause_started",
           category: "alarm",
           severity: "warning",
-          title: "Alarm đã được tạm dừng",
+          title: "Báo động đã được tạm dừng",
           message: homeNotificationMessage,
           entityType: "home",
           entityId: homeId,
@@ -10493,6 +15054,221 @@ Nên trong khoảng thời gian này:
     );
   }
 });
+
+// ================= HOME SIREN ACTION REQUEST =================
+// Nút trong DeviceList chỉ tắt còi vật lý của Home. Incident, fullscreen và
+// notification vẫn tiếp tục cho đến khi sự cố được xử lý hoặc tự kết thúc.
+function scheduleHomeSirenActionRequestCleanup(requestRef) {
+  setTimeout(() => {
+    void requestRef.remove().catch(() => { });
+  }, HOME_SIREN_ACTION_RESULT_TTL_MS);
+}
+
+async function finishHomeSirenActionRequest(
+  requestRef,
+  status,
+  details = {},
+) {
+  await requestRef.update({
+    status,
+    ...details,
+    completedAt: Date.now(),
+  });
+
+  scheduleHomeSirenActionRequestCleanup(requestRef);
+}
+
+db.ref("home_siren_action_requests").on(
+  "child_added",
+  async (snap) => {
+    const req = snap.val();
+    const requestId = snap.key;
+    let ownsRequest = false;
+
+    async function reject(reason) {
+      console.log(
+        "❌ HOME SIREN ACTION REJECTED:",
+        requestId,
+        reason,
+      );
+
+      try {
+        await finishHomeSirenActionRequest(
+          snap.ref,
+          "failed",
+          {
+            reason,
+            processingHubId: DEVICE_ID,
+          },
+        );
+      } catch (_) { }
+    }
+
+    try {
+      if (!req || !requestId) {
+        return;
+      }
+
+      if (
+        req.status === "succeeded" ||
+        req.status === "failed" ||
+        req.status === "rejected"
+      ) {
+        scheduleHomeSirenActionRequestCleanup(snap.ref);
+        return;
+      }
+
+      if (req.status !== "pending") {
+        return;
+      }
+
+      if (homeSirenActionInProgress.has(requestId)) {
+        return;
+      }
+
+      homeSirenActionInProgress.add(requestId);
+
+      const homeId = String(req.homeId || "").trim();
+      const requestedHubId = String(req.hubId || "").trim();
+      const requestedBy = String(
+        req.requestedBy || "",
+      ).trim();
+      const action = String(req.action || "").trim();
+      const createdAt = Number(req.createdAt);
+      const now = Date.now();
+
+      if (
+        !homeId ||
+        !requestedHubId ||
+        !requestedBy ||
+        action !== "mute" ||
+        !Number.isFinite(createdAt) ||
+        createdAt > now + 1000 ||
+        createdAt < now - 5 * 60 * 1000
+      ) {
+        ownsRequest = true;
+        await reject("invalid_request");
+        return;
+      }
+
+      let requesterAccount =
+        getCachedAccountData(requestedBy);
+
+      if (!requesterAccount) {
+        const accountSnap = await db
+          .ref(`accounts/${requestedBy}`)
+          .once("value");
+        requesterAccount = accountSnap.val() || null;
+      }
+
+      let ownerUid = "";
+
+      if (requesterAccount?.homes?.[homeId]) {
+        ownerUid = requestedBy;
+      } else {
+        ownerUid = String(
+          requesterAccount?.sharedHomes?.[homeId]?.ownerUid || "",
+        ).trim();
+      }
+
+      if (!ownerUid) {
+        ownsRequest = true;
+        await reject("home_access_denied");
+        return;
+      }
+
+      let home = getCachedHomeData(ownerUid, homeId);
+
+      if (!home) {
+        const homeSnap = await db
+          .ref(`accounts/${ownerUid}/homes/${homeId}`)
+          .once("value");
+        home = homeSnap.val() || null;
+      }
+
+      if (!home) {
+        ownsRequest = true;
+        await reject("home_not_found");
+        return;
+      }
+
+      // hubId lưu trong Home là nguồn hiện tại. hubId từ app chỉ là gợi ý để
+      // request vẫn đi được khi cache UI vừa cũ hoặc heartbeat vừa đổi Hub.
+      const homeHubId = String(home.hubId || "").trim();
+      const targetHubId = homeHubId || requestedHubId;
+
+      if (targetHubId !== DEVICE_ID) {
+        return;
+      }
+
+      ownsRequest = true;
+
+      await snap.ref.update({
+        status: "processing",
+        processingHubId: DEVICE_ID,
+        startedAt: Date.now(),
+      });
+
+      const result = await mutePhysicalSirenForHome(
+        ownerUid,
+        homeId,
+        requestedBy,
+        { reason: "device_list_mute_button" },
+      );
+
+      const succeeded = result.status === "stopped";
+
+      console.log(
+        "🔕 HOME SIREN MUTED FROM DEVICE LIST:",
+        requestId,
+        requestedBy,
+        ownerUid,
+        homeId,
+        result.status,
+        `confirmed=${result.confirmedCount || 0}/${result.deviceCount || 0}`,
+      );
+
+      await finishHomeSirenActionRequest(
+        snap.ref,
+        succeeded ? "succeeded" : "failed",
+        {
+          resultStatus: result.status,
+          ownerUid,
+          homeId,
+          hubId: DEVICE_ID,
+          deviceCount: Number(result.deviceCount || 0),
+          successCount: Number(result.successCount || 0),
+          confirmedCount: Number(result.confirmedCount || 0),
+          reason: succeeded ? "" : result.status,
+        },
+      );
+    } catch (error) {
+      console.log(
+        "HOME SIREN ACTION ERROR:",
+        requestId,
+        error.message,
+      );
+
+      if (ownsRequest) {
+        try {
+          await finishHomeSirenActionRequest(
+            snap.ref,
+            "failed",
+            {
+              reason: "backend_error",
+              error: String(error.message || "").slice(0, 300),
+              processingHubId: DEVICE_ID,
+            },
+          );
+        } catch (_) { }
+      }
+    } finally {
+      if (requestId) {
+        homeSirenActionInProgress.delete(requestId);
+      }
+    }
+  },
+);
 
 // ================= ALARM INCIDENT ACTION REQUEST =================
 db.ref("alarm_incident_action_requests").on(
@@ -10543,6 +15319,7 @@ db.ref("alarm_incident_action_requests").on(
         "stop",
         "check_home",
         "resolve",
+        "mute_siren",
       ]);
 
       if (
@@ -10617,6 +15394,42 @@ db.ref("alarm_incident_action_requests").on(
         return;
       }
 
+      // Tắt riêng còi vật lý của Home nhưng giữ nguyên incident, fullscreen
+      // và notification. Mute được gắn với snapshot các incident active hiện
+      // tại; sự cố mới sau đó vẫn có thể bật còi trở lại.
+      if (action === "mute_siren") {
+        if (incident.status === "active") {
+          await mutePhysicalSirenForHome(
+            ownerUid,
+            homeId,
+            requestedBy,
+            { reason: "manual_mute_button" },
+          );
+
+          await db
+            .ref(
+              `accounts/${receiverUid}/alarmIncidents/${incidentId}`,
+            )
+            .update({
+              homeSirenStatus: "manual_muted",
+              homeSirenMutedAt: now,
+              homeSirenMutedBy: requestedBy,
+              updatedAt: now,
+            });
+        }
+
+        await snap.ref.remove();
+
+        console.log(
+          "🔕 ALARM HOME SIREN MUTED:",
+          requestId,
+          receiverUid,
+          incidentId,
+        );
+
+        return;
+      }
+
       // Idempotent: nếu thiết bị khác của cùng tài khoản hoặc một
       // request trước đó đã xử lý incident này, lần bấm sau vẫn được
       // coi là thành công và chỉ đóng Alarm của tài khoản hiện tại.
@@ -10633,6 +15446,12 @@ db.ref("alarm_incident_action_requests").on(
             incident.status ||
             "already_resolved",
           ),
+          flowType: String(
+            incident.flowType || incident.eventCategory || "security",
+          ),
+          status: String(incident.status || "resolved"),
+          hasRemainingActiveIncidents:
+            hasLocalActiveAlarmIncidentForReceiver(receiverUid),
         });
 
         await snap.ref.remove();
@@ -10646,6 +15465,18 @@ db.ref("alarm_incident_action_requests").on(
         );
 
         return;
+      }
+
+      // Nút "Tắt cảnh báo" cũng phải tắt còi cho toàn Home. Nếu chỉ
+      // resolve incident của tài khoản hiện tại, các bản sao incident của
+      // thành viên khác sẽ khiến vòng reconcile bật còi trở lại sau 15 giây.
+      if (action === "stop") {
+        await mutePhysicalSirenForHome(
+          ownerUid,
+          homeId,
+          requestedBy,
+          { reason: "stop_alarm_button" },
+        );
       }
 
       await resolveAlarmIncidentForReceiver({
@@ -10676,8 +15507,6 @@ db.ref("alarm_incident_action_requests").on(
   },
 );
 
-init();
-
 // ================= MQTT CONNECT =================
 client.on("connect", () => {
   mqttConnected = true;
@@ -10687,6 +15516,14 @@ client.on("connect", () => {
 
   // Cập nhật ngay để app biết MQTT đã hoạt động.
   void writeHubHeartbeat();
+
+  // Nếu MQTT vừa mất kết nối trong lúc có Alarm, gửi lại trạng thái còi.
+  setTimeout(() => {
+    void reconcileAllPhysicalSirens({
+      force: true,
+      reason: "mqtt_connected",
+    });
+  }, 1000);
 });
 
 client.on("offline", () => {
@@ -10898,6 +15735,409 @@ db.ref("pair_requests").on("child_removed", (snap) => {
   console.log("🧹 REQUEST REMOVED:", snap.key);
 });
 
+// ================= CO SENSOR FAST PATH =================
+function isCarbonMonoxidePayload(data) {
+  return Boolean(
+    data &&
+    typeof data === "object" &&
+    (
+      data.carbon_monoxide !== undefined ||
+      data.co_alarm !== undefined ||
+      data.co !== undefined
+    )
+  );
+}
+
+function telemetryValueChanged(previousValue, nextValue) {
+  if (nextValue === undefined) {
+    return false;
+  }
+
+  const previousNumber = Number(previousValue);
+  const nextNumber = Number(nextValue);
+
+  if (
+    Number.isFinite(previousNumber) &&
+    Number.isFinite(nextNumber)
+  ) {
+    return previousNumber !== nextNumber;
+  }
+
+  return previousValue !== nextValue;
+}
+
+async function processCarbonMonoxidePacket(
+  deviceId,
+  uid,
+  homeId,
+  data,
+) {
+  const deviceRef = db.ref(
+    `accounts/${uid}/homes/${homeId}/devices/${deviceId}`,
+  );
+
+  let runtime = coSensorRuntimeMap.get(deviceId);
+
+  // Ưu tiên snapshot cục bộ để CO vẫn xử lý được ngay khi Firebase mất mạng.
+  if (!runtime) {
+    let persistedDevice =
+      getCachedHomeData(uid, homeId)?.devices?.[deviceId] || null;
+
+    if (!persistedDevice && firebaseConnected) {
+      try {
+        const deviceSnap = await deviceRef.once("value");
+        persistedDevice = deviceSnap.val();
+      } catch (error) {
+        console.log(
+          "CO FIREBASE READ FALLBACK:",
+          deviceId,
+          error.message,
+        );
+      }
+    }
+
+    if (!persistedDevice) {
+      console.log(
+        "⚠️ CO SKIPPED, NO LOCAL SNAPSHOT:",
+        deviceId,
+      );
+      return;
+    }
+
+    runtime = {
+      device: { ...persistedDevice },
+      persistedCarbonMonoxide:
+        persistedDevice.carbon_monoxide,
+      persistedCoAlarm: persistedDevice.co_alarm,
+      persistedCo: persistedDevice.co,
+      persistedLastSeen: persistedDevice.last_seen,
+      persistedLinkquality: persistedDevice.linkquality,
+      lastCoPersistAt: 0,
+      lastTelemetryPersistAt: 0,
+    };
+
+    coSensorRuntimeMap.set(deviceId, runtime);
+  }
+
+  const now = Date.now();
+  const oldDevice = { ...runtime.device };
+  const nextDevice = { ...oldDevice };
+
+  const coFields = [
+    "carbon_monoxide",
+    "co_alarm",
+    "co",
+    "last_seen",
+    "linkquality",
+    "availability",
+  ];
+
+  for (const field of coFields) {
+    if (data[field] !== undefined) {
+      nextDevice[field] = data[field];
+    }
+  }
+
+  if (
+    String(oldDevice.type || "unknown").trim() === "unknown"
+  ) {
+    nextDevice.type = "carbon_monoxide";
+  }
+
+  const oldAlarmActive =
+    isActiveSignal(oldDevice.carbon_monoxide) ||
+    isActiveSignal(oldDevice.co_alarm);
+  const nextAlarmActive =
+    isActiveSignal(nextDevice.carbon_monoxide) ||
+    isActiveSignal(nextDevice.co_alarm);
+  const alarmActiveChanged =
+    oldAlarmActive !== nextAlarmActive;
+
+  const carbonMonoxideNeedsPersist =
+    data.carbon_monoxide !== undefined &&
+    data.carbon_monoxide !==
+      runtime.persistedCarbonMonoxide;
+  const coAlarmNeedsPersist =
+    data.co_alarm !== undefined &&
+    data.co_alarm !== runtime.persistedCoAlarm;
+  const alarmStateNeedsPersist =
+    carbonMonoxideNeedsPersist || coAlarmNeedsPersist;
+
+  const coValueChanged = telemetryValueChanged(
+    runtime.persistedCo,
+    data.co,
+  );
+  const coPersistDue =
+    coValueChanged &&
+    (
+      runtime.lastCoPersistAt === 0 ||
+      now - runtime.lastCoPersistAt >=
+        CO_VALUE_PERSIST_INTERVAL_MS ||
+      alarmStateNeedsPersist
+    );
+
+  const telemetryPersistDue =
+    runtime.lastTelemetryPersistAt === 0 ||
+    now - runtime.lastTelemetryPersistAt >=
+      CO_TELEMETRY_PERSIST_INTERVAL_MS;
+
+  const updateData = {};
+
+  // OFF → ON và ON → OFF luôn ghi ngay lập tức.
+  if (carbonMonoxideNeedsPersist) {
+    updateData.carbon_monoxide =
+      data.carbon_monoxide;
+  }
+
+  if (coAlarmNeedsPersist) {
+    updateData.co_alarm = data.co_alarm;
+  }
+
+  // ppm chỉ ghi tối đa 30 giây/lần và chỉ khi giá trị thay đổi.
+  if (coPersistDue) {
+    updateData.co = data.co;
+  }
+
+  // last_seen/linkquality chỉ ghi tối đa 60 giây/lần.
+  if (telemetryPersistDue) {
+    if (data.last_seen !== undefined) {
+      updateData.last_seen = data.last_seen;
+    }
+
+    if (data.linkquality !== undefined) {
+      updateData.linkquality = data.linkquality;
+    }
+
+    if (data.availability !== undefined) {
+      updateData.availability = data.availability;
+    }
+  }
+
+  if (
+    oldDevice.type === "unknown" ||
+    oldDevice.type === undefined ||
+    oldDevice.type === null
+  ) {
+    updateData.type = "carbon_monoxide";
+  }
+
+  if (alarmActiveChanged) {
+    updateData.last_event = now;
+  }
+
+  runtime.device = nextDevice;
+
+  if (Object.keys(updateData).length === 0) {
+    return;
+  }
+
+  updateData.updated_at = now;
+  const latestHomeFromCache = applyDeviceUpdateToLocalCache(
+    uid,
+    homeId,
+    deviceId,
+    updateData,
+  );
+
+  if (firebaseConnected) {
+    try {
+      await deviceRef.update(updateData);
+    } catch (error) {
+      console.log(
+        "📴 CO UPDATE QUEUED:",
+        deviceId,
+        error.message,
+      );
+      enqueueOfflineFirebaseUpdate(
+        `accounts/${uid}/homes/${homeId}/devices/${deviceId}`,
+        updateData,
+      );
+    }
+  } else {
+    enqueueOfflineFirebaseUpdate(
+      `accounts/${uid}/homes/${homeId}/devices/${deviceId}`,
+      updateData,
+    );
+  }
+
+  runtime.device = {
+    ...runtime.device,
+    ...updateData,
+  };
+
+  if (updateData.carbon_monoxide !== undefined) {
+    runtime.persistedCarbonMonoxide =
+      updateData.carbon_monoxide;
+  }
+
+  if (updateData.co_alarm !== undefined) {
+    runtime.persistedCoAlarm = updateData.co_alarm;
+  }
+
+  if (updateData.co !== undefined) {
+    runtime.persistedCo = updateData.co;
+    runtime.lastCoPersistAt = now;
+  }
+
+  if (
+    updateData.last_seen !== undefined ||
+    updateData.linkquality !== undefined ||
+    updateData.availability !== undefined
+  ) {
+    runtime.persistedLastSeen = updateData.last_seen ??
+      runtime.persistedLastSeen;
+    runtime.persistedLinkquality = updateData.linkquality ??
+      runtime.persistedLinkquality;
+    runtime.lastTelemetryPersistAt = now;
+  }
+
+  console.log("☠️ CO FIREBASE UPDATE:", deviceId, updateData);
+
+  // Chỉ khi trạng thái an toàn/nguy hiểm thực sự đổi mới đọc dữ liệu Home,
+  // tạo lịch sử và chạy Alarm cho tất cả thành viên.
+  if (!alarmActiveChanged) {
+    return;
+  }
+
+  const deviceName =
+    runtime.device.name || oldDevice.name || deviceId;
+  const latestCo = Number(
+    nextDevice.co ?? oldDevice.co,
+  );
+  const coText = Number.isFinite(latestCo)
+    ? ` (${latestCo} ppm)`
+    : "";
+
+  if (firebaseConnected) {
+    await addDeviceNotification(
+      uid,
+      homeId,
+      deviceId,
+      nextAlarmActive
+        ? `Phát hiện khí CO${coText}`
+        : `Khí CO đã trở lại bình thường${coText}`,
+      "status",
+    );
+  }
+
+  // Khi CO hết nguy hiểm, đóng ngay các incident CO tương ứng và dừng còi
+  // vật lý; không chờ auto-expire 30 phút.
+  if (!nextAlarmActive) {
+    const latestHomeData =
+      latestHomeFromCache ||
+      getCachedHomeData(uid, homeId) ||
+      {};
+
+    if (firebaseConnected) {
+      try {
+        await resolveClearedPersistentEmergencyIncidents(
+          uid,
+          homeId,
+          {
+            homeOverride: latestHomeData,
+            reason: "carbon_monoxide_cleared",
+          },
+        );
+      } catch (error) {
+        console.log(
+          "CO INCIDENT RESOLVE DEFERRED:",
+          homeId,
+          error.message,
+        );
+      }
+    }
+
+    await reconcileOfflineAlarmDemandsForHome(uid, homeId);
+    return;
+  }
+
+  const latestHomeData =
+    latestHomeFromCache ||
+    getCachedHomeData(uid, homeId) ||
+    {};
+  const homeName = latestHomeData.name || homeId;
+
+  // processScheduleAlarmsForOwner cần state cũ để nhận đúng cạnh OFF → ON.
+  const homeDataForAlarm = {
+    ...latestHomeData,
+    devices: {
+      ...(latestHomeData.devices || {}),
+      [deviceId]: oldDevice,
+    },
+  };
+
+  const alarmReceiverUids = getAlarmReceiverUidsForHome(
+    uid,
+    homeId,
+  );
+
+  for (const receiverUid of alarmReceiverUids) {
+    try {
+      await processScheduleAlarmsForOwner(
+        receiverUid,
+        uid,
+        homeId,
+        homeName,
+        deviceId,
+        deviceName,
+        "carbon_monoxide",
+        homeDataForAlarm,
+        {
+          carbon_monoxide: nextDevice.carbon_monoxide,
+          co_alarm: nextDevice.co_alarm,
+          co: nextDevice.co,
+          last_event: now,
+          updated_at: now,
+        },
+      );
+    } catch (receiverError) {
+      console.log(
+        "CO ALARM RECEIVER ERROR:",
+        receiverUid,
+        uid,
+        homeId,
+        receiverError.message,
+      );
+    }
+  }
+
+  await reconcileOfflineAlarmDemandsForHome(uid, homeId);
+}
+
+async function enqueueCarbonMonoxidePacket(
+  deviceId,
+  uid,
+  homeId,
+  data,
+) {
+  const previous =
+    coSensorProcessingPromiseMap.get(deviceId) ||
+    Promise.resolve();
+
+  const current = previous
+    .catch(() => { })
+    .then(() => {
+      return processCarbonMonoxidePacket(
+        deviceId,
+        uid,
+        homeId,
+        data,
+      );
+    });
+
+  coSensorProcessingPromiseMap.set(deviceId, current);
+
+  try {
+    await current;
+  } finally {
+    if (
+      coSensorProcessingPromiseMap.get(deviceId) === current
+    ) {
+      coSensorProcessingPromiseMap.delete(deviceId);
+    }
+  }
+}
+
 // ================= MQTT HANDLER =================
 client.on("message", async (topic, msg) => {
   try {
@@ -10943,138 +16183,162 @@ client.on("message", async (topic, msg) => {
           payload?.definition?.description,
           ieee,
         );
-        let defaultName = "Thiết bị";
-
         const devicesSnap = await db
           .ref(`accounts/${uid}/homes/${homeId}/devices`)
           .once("value");
 
         const devices = devicesSnap.val() || {};
+        const sameTypeDevices = Object.values(devices).filter((device) => {
+          return device?.type === deviceType;
+        });
 
-        const sameTypeCount = Object.values(devices).filter((d) => {
-          return d?.type === deviceType;
-        }).length + 1;
+        let defaultBaseName = "Thiết bị chưa nhận diện";
 
         switch (deviceType) {
           case "door":
-            defaultName = `Cửa ${sameTypeCount}`;
+            defaultBaseName = "Cửa Nhà";
             break;
 
           case "window":
-            defaultName = `Cửa sổ ${sameTypeCount}`;
+            defaultBaseName = "Cửa Sổ";
             break;
 
           case "gate":
-            defaultName = `Cổng ${sameTypeCount}`;
+            defaultBaseName = "Cổng Nhà";
             break;
 
           case "door_lock":
           case "lock":
-            defaultName = `Khóa thông minh ${sameTypeCount}`;
+            defaultBaseName = "Khóa Cửa";
             break;
 
           case "motion":
-            defaultName = `Cảm biến chuyển động ${sameTypeCount}`;
+            defaultBaseName = "Giám sát chuyển động";
             break;
 
           case "presence":
-            defaultName = `Cảm biến hiện diện ${sameTypeCount}`;
+            defaultBaseName = "Giám sát hiện diện";
             break;
 
           case "vibration":
-            defaultName = `Cảm biến rung ${sameTypeCount}`;
+            defaultBaseName = "Ghi nhận rung chấn";
             break;
 
           case "glass_break":
-            defaultName = `Cảm biến kính vỡ ${sameTypeCount}`;
+            defaultBaseName = "Phát hiện kính vỡ";
             break;
 
           case "smoke":
-            defaultName = `Báo cháy ${sameTypeCount}`;
+            defaultBaseName = "Báo cháy";
             break;
 
           case "heat":
-            defaultName = `Cảm biến nhiệt nguy hiểm ${sameTypeCount}`;
+            defaultBaseName = "Cảnh báo nhiệt độ";
             break;
 
           case "carbon_monoxide":
-            defaultName = `Cảm biến khí CO ${sameTypeCount}`;
+            defaultBaseName = "Cảnh báo khí CO";
             break;
 
           case "gas":
-            defaultName = `Cảm biến gas ${sameTypeCount}`;
+            defaultBaseName = "Cảnh báo rò rỉ gas";
             break;
 
           case "water_leak":
           case "flood":
-            defaultName = `Cảm biến ngập nước ${sameTypeCount}`;
+            defaultBaseName = "Cảnh báo ngập nước";
             break;
 
           case "temperature":
-            defaultName = `Nhiệt độ ${sameTypeCount}`;
+            defaultBaseName = "Nhiệt độ và độ ẩm";
             break;
 
           case "sos":
-            defaultName = `SOS ${sameTypeCount}`;
+            defaultBaseName = "Nút SOS";
             break;
 
           case "smart_plug":
-            defaultName = `Ổ điện thông minh ${sameTypeCount}`;
+            defaultBaseName = "Ổ cắm thông minh";
             break;
 
           case "power_monitor":
-            defaultName = `Đo điện năng ${sameTypeCount}`;
+            defaultBaseName = "Theo dõi điện năng";
             break;
 
           case "ups":
-            defaultName = `Nguồn dự phòng ${sameTypeCount}`;
+            defaultBaseName = "Nguồn dự phòng";
             break;
 
           case "siren":
-            defaultName = `Còi báo động ${sameTypeCount}`;
+            defaultBaseName = "Còi báo động";
             break;
 
           case "smart_valve":
-            defaultName = `Van thông minh ${sameTypeCount}`;
+            defaultBaseName = "Van nước thông minh";
             break;
 
           case "camera":
-            defaultName = `Camera ${sameTypeCount}`;
+            defaultBaseName = "Camera";
             break;
 
           case "doorbell":
-            defaultName = `Chuông cửa ${sameTypeCount}`;
+            defaultBaseName = "Chuông cửa";
             break;
 
           case "keypad":
-            defaultName = `Bàn phím an ninh ${sameTypeCount}`;
+            defaultBaseName = "Bàn phím an ninh";
             break;
 
           case "repeater":
-            defaultName = `Bộ mở rộng sóng ${sameTypeCount}`;
+            defaultBaseName = "Bộ mở rộng sóng";
             break;
+        }
 
-          default:
-            defaultName = `Thiết bị chưa nhận diện ${sameTypeCount}`;
+        // Thiết bị đầu tiên không có số. Từ thiết bị thứ hai mới dùng 2, 3...
+        // Đồng thời tránh trùng tên nếu một thiết bị cũ đã bị xóa hoặc đổi tên.
+        let defaultName = defaultBaseName;
+
+        if (sameTypeDevices.length > 0) {
+          const existingNames = new Set(
+            sameTypeDevices.map((device) => {
+              return String(device?.name || "").trim();
+            }),
+          );
+
+          let sequenceNumber = Math.max(2, sameTypeDevices.length + 1);
+
+          while (existingNames.has(`${defaultBaseName} ${sequenceNumber}`)) {
+            sequenceNumber += 1;
+          }
+
+          defaultName = `${defaultBaseName} ${sequenceNumber}`;
         }
         await db.ref(`accounts/${uid}/homes/${homeId}/devices/${ieee}`).set({
           name: defaultName,
           ieee,
           type: deviceType,
           roomId: roomId || "unassigned",
+          // `alarm` là lịch Map đối với sensor an ninh, nhưng là trạng thái
+          // boolean đối với còi. Chỉ ghi đúng kiểu theo loại thiết bị.
           alarm:
-            isSecurityDeviceType(deviceType)
-              ? {
-                enabled: true,
-                start: "23:00",
-                end: "06:00",
-                repeatMinutes: 0,
-              }
-              : null,
+            deviceType === "siren"
+              ? null
+              : isSecurityDeviceType(deviceType)
+                ? {
+                    enabled: true,
+                    start: "23:00",
+                    end: "06:00",
+                    repeatMinutes: 0,
+                    days: [1, 2, 3, 4, 5, 6, 7],
+                  }
+                : null,
           availability: "unknown",
           last_seen: null,
 
           battery: null,
+          battery_low: null,
+          battpercentage: null,
+          voltage: null,
           linkquality: null,
 
           contact: null,
@@ -11083,6 +16347,28 @@ client.on("message", async (topic, msg) => {
           temperature: null,
           humidity: null,
           action: null,
+
+          // Cảm biến chuyển động / rung.
+          occupancy: null,
+          motion: null,
+          vibration: null,
+          vibration_strength: null,
+          last_vibration_at: null,
+          vibration_active_until: null,
+          glass_break: null,
+          broken_glass: null,
+          sensitivity: null,
+
+          // Cảm biến khí CO.
+          carbon_monoxide: null,
+          co: null,
+
+          // Còi báo động. Bước này chỉ lưu cấu hình nhận được,
+          // chưa tự động gửi lệnh bật còi.
+          melody: null,
+          duration: null,
+          volume: null,
+          last_siren_report_at: null,
 
           last_event: null,
           created: Date.now(),
@@ -11098,6 +16384,7 @@ client.on("message", async (topic, msg) => {
         });
 
         deviceMap[ieee] = { uid, homeId };
+        scheduleLocalRuntimeSnapshotSave();
 
         console.log("✅ DEVICE READY:", ieee);
         return;
@@ -11113,6 +16400,12 @@ client.on("message", async (topic, msg) => {
     const topicParts = rawTopic.split("/");
     const deviceId = topicParts[0];
     const subTopic = topicParts[1] || null;
+
+    // Không coi chính lệnh điều khiển /set hoặc /get là trạng thái sensor.
+    // Chỉ lưu trạng thái thực do Zigbee2MQTT publish lại ở topic thiết bị.
+    if (subTopic === "set" || subTopic === "get") {
+      return;
+    }
 
     if (subTopic === "availability") {
       const availabilityValue =
@@ -11179,19 +16472,53 @@ client.on("message", async (topic, msg) => {
 
     const { uid, homeId } = map;
 
+    // Fast path riêng cho cảm biến CO: giữ Alarm tức thời nhưng không đọc/ghi
+    // Firebase theo từng packet MQTT liên tục.
+    if (isCarbonMonoxidePayload(data)) {
+      await enqueueCarbonMonoxidePacket(
+        deviceId,
+        uid,
+        homeId,
+        data,
+      );
+      return;
+    }
+
     const deviceRef = db.ref(
       `accounts/${uid}/homes/${homeId}/devices/${deviceId}`,
     );
 
-    const oldSnap = await deviceRef.once("value");
-    const oldData = oldSnap.val() || {};
+    let homeData = getCachedHomeData(uid, homeId);
+    let oldData = homeData?.devices?.[deviceId] || null;
+
+    if ((!homeData || !oldData) && firebaseConnected) {
+      try {
+        const [oldSnap, homeSnap] = await Promise.all([
+          deviceRef.once("value"),
+          db.ref(`accounts/${uid}/homes/${homeId}`)
+            .once("value"),
+        ]);
+
+        oldData = oldSnap.val() || oldData || {};
+        homeData = homeSnap.val() || homeData || {};
+      } catch (error) {
+        console.log(
+          "MQTT FIREBASE READ FALLBACK:",
+          deviceId,
+          error.message,
+        );
+      }
+    }
+
+    if (!homeData || !oldData) {
+      console.log(
+        "⚠️ SENSOR SKIPPED, NO LOCAL SNAPSHOT:",
+        deviceId,
+      );
+      return;
+    }
+
     const deviceName = oldData.name || deviceId;
-
-    const homeSnap = await db
-      .ref(`accounts/${uid}/homes/${homeId}`)
-      .once("value");
-
-    const homeData = homeSnap.val() || {};
     const homeName = homeData.name || homeId;
 
     const oldTamper = oldData.tamper;
@@ -11236,6 +16563,9 @@ client.on("message", async (topic, msg) => {
       "presence",
       "vibration",
       "vibration_strength",
+      "glass_break",
+      "broken_glass",
+      "sensitivity",
       "angle",
       "x_axis",
       "y_axis",
@@ -11244,6 +16574,7 @@ client.on("message", async (topic, msg) => {
       "gas_alarm",
       "carbon_monoxide",
       "co_alarm",
+      "co",
       "water_leak",
       "leak",
       "water",
@@ -11260,12 +16591,33 @@ client.on("message", async (topic, msg) => {
       "consumption",
       "device_temperature",
       "switch_type",
+
+      // Cấu hình của còi NEO NAS-AB02B2. Trạng thái `alarm` được
+      // copy riêng sau khi đã chắc chắn đây là thiết bị còi, tránh ghi đè
+      // Map lịch Alarm của sensor an ninh.
+      "melody",
+      "duration",
+      "volume",
+      "battpercentage",
     ];
 
     for (const field of fieldsToCopy) {
       if (data[field] !== undefined) {
         updateData[field] = data[field];
       }
+    }
+
+    const provisionalDeviceType =
+      updateData.type ||
+      currentDeviceType ||
+      inferredDeviceType ||
+      "unknown";
+
+    if (
+      provisionalDeviceType === "siren" &&
+      data.alarm !== undefined
+    ) {
+      updateData.alarm = data.alarm;
     }
 
     const eventFields = [
@@ -11277,6 +16629,8 @@ client.on("message", async (topic, msg) => {
       "motion",
       "presence",
       "vibration",
+      "glass_break",
+      "broken_glass",
       "gas",
       "gas_alarm",
       "carbon_monoxide",
@@ -11290,21 +16644,88 @@ client.on("message", async (topic, msg) => {
       "lock",
       "lock_state",
       "state",
+      "alarm",
     ];
 
-    if (
-      eventFields.some((field) => {
-        return (
-          data[field] !== undefined &&
-          data[field] !== oldData[field]
-        );
-      })
-    ) {
+    const hasChangedEventField = eventFields.some((field) => {
+      if (field === "alarm" && provisionalDeviceType !== "siren") {
+        return false;
+      }
+
+      return (
+        data[field] !== undefined &&
+        data[field] !== oldData[field]
+      );
+    });
+
+    const vibrationEventPacket =
+      provisionalDeviceType === "vibration" &&
+      (
+        (
+          isActiveSignal(data.vibration) &&
+          !isActiveSignal(oldData.vibration)
+        ) ||
+        (
+          isVibrationAction(data.action) &&
+          (
+            !isVibrationAction(oldData.action) ||
+            now - Number(oldData.last_vibration_at || 0) >
+              VIBRATION_ACTIVE_WINDOW_MS
+          )
+        )
+      );
+    const glassBreakEventPacket =
+      provisionalDeviceType === "glass_break" &&
+      (
+        (
+          (
+            isActiveSignal(data.glass_break) ||
+            isActiveSignal(data.broken_glass)
+          ) &&
+          !(
+            isActiveSignal(oldData.glass_break) ||
+            isActiveSignal(oldData.broken_glass)
+          )
+        ) ||
+        (
+          isGlassBreakAction(data.action) &&
+          !isGlassBreakAction(oldData.action)
+        )
+      );
+    const vibrationClearPacket =
+      provisionalDeviceType === "vibration" &&
+      data.vibration !== undefined &&
+      !isActiveSignal(data.vibration) &&
+      !isVibrationAction(data.action);
+    const shouldRecordLastEvent =
+      provisionalDeviceType === "vibration"
+        ? vibrationEventPacket
+        : provisionalDeviceType === "glass_break"
+          ? glassBreakEventPacket
+          : hasChangedEventField && !vibrationClearPacket;
+
+    if (shouldRecordLastEvent) {
       updateData.last_event = now;
     }
 
     if (data.battery !== undefined) {
       updateData.battery_status = "percent";
+    }
+
+    // Còi NEO dùng battpercentage thay cho battery. Chuẩn hóa thêm về
+    // battery để phần UI/kiểm tra pin hiện có dùng chung được ngay.
+    if (
+      data.battpercentage !== undefined &&
+      data.battery === undefined
+    ) {
+      const normalizedBattery = Number(
+        data.battpercentage,
+      );
+
+      if (Number.isFinite(normalizedBattery)) {
+        updateData.battery = normalizedBattery;
+        updateData.battery_status = "percent";
+      }
     }
 
     if (data.battery_low !== undefined) {
@@ -11327,8 +16748,100 @@ client.on("message", async (topic, msg) => {
         now + 5 * 60 * 1000;
     }
 
+    if (resolvedDeviceType === "vibration") {
+      if (vibrationEventPacket) {
+        updateData.last_event = now;
+        updateData.last_vibration_at = now;
+        updateData.vibration_active_until =
+          now + VIBRATION_ACTIVE_WINDOW_MS;
+      } else if (
+        data.vibration !== undefined &&
+        !isActiveSignal(data.vibration)
+      ) {
+        updateData.vibration_active_until = null;
+      }
+    }
 
-    await deviceRef.update(updateData);
+    if (
+      resolvedDeviceType === "siren" &&
+      data.alarm !== undefined
+    ) {
+      // Chỉ timestamp packet trạng thái thật do Zigbee2MQTT trả về.
+      // Không dùng updated_at vì telemetry khác có thể làm xác nhận OFF sai.
+      updateData.last_siren_report_at = now;
+    }
+
+    const latestHomeFromCache = applyDeviceUpdateToLocalCache(
+      uid,
+      homeId,
+      deviceId,
+      updateData,
+    );
+
+    if (firebaseConnected) {
+      try {
+        await deviceRef.update(updateData);
+      } catch (error) {
+        console.log(
+          "📴 DEVICE UPDATE QUEUED:",
+          deviceId,
+          error.message,
+        );
+        enqueueOfflineFirebaseUpdate(
+          `accounts/${uid}/homes/${homeId}/devices/${deviceId}`,
+          updateData,
+        );
+      }
+    } else {
+      enqueueOfflineFirebaseUpdate(
+        `accounts/${uid}/homes/${homeId}/devices/${deviceId}`,
+        updateData,
+      );
+    }
+
+    if (
+      resolvedDeviceType === "vibration" &&
+      updateData.last_vibration_at === now
+    ) {
+      scheduleVibrationStateClear(
+        uid,
+        homeId,
+        deviceId,
+        now,
+      );
+    } else if (
+      resolvedDeviceType === "vibration" &&
+      data.vibration !== undefined &&
+      !isActiveSignal(data.vibration)
+    ) {
+      cancelVibrationStateClear(uid, homeId, deviceId);
+    }
+
+    // Còi có duration hữu hạn. Nếu nó tự OFF trong khi Home vẫn còn incident
+    // yêu cầu còi, bật lại ngay thay vì chờ chu kỳ refresh 20 phút.
+    if (
+      resolvedDeviceType === "siren" &&
+      data.alarm !== undefined &&
+      !isActiveSignal(data.alarm)
+    ) {
+      const sirenRuntime = homeSirenRuntimeMap.get(
+        getHomeSirenRuntimeKey(uid, homeId),
+      );
+
+      if (sirenRuntime?.desiredOn === true) {
+        setTimeout(() => {
+          void setPhysicalSirenForHome(
+            uid,
+            homeId,
+            true,
+            {
+              force: true,
+              reason: "siren_reported_off_while_incident_active",
+            },
+          );
+        }, 1000);
+      }
+    }
 
     const incidentStateFields = [
       "contact",
@@ -11349,28 +16862,72 @@ client.on("message", async (topic, msg) => {
         );
       });
 
-    if (incidentStateChanged) {
-      const latestHomeData = {
-        ...homeData,
-        devices: {
-          ...(homeData.devices || {}),
-          [deviceId]: {
-            ...oldData,
-            ...updateData,
-          },
+    const latestHomeData = latestHomeFromCache || {
+      ...homeData,
+      devices: {
+        ...(homeData.devices || {}),
+        [deviceId]: {
+          ...oldData,
+          ...updateData,
         },
-      };
+      },
+    };
 
-      await validateSecurityIncidentsForHome(
-        uid,
-        homeId,
-        "device_state_changed",
-        { homeOverride: latestHomeData },
-      );
+    if (incidentStateChanged && firebaseConnected) {
+      try {
+        await validateSecurityIncidentsForHome(
+          uid,
+          homeId,
+          "device_state_changed",
+          { homeOverride: latestHomeData },
+        );
+      } catch (error) {
+        console.log(
+          "SECURITY INCIDENT VALIDATION DEFERRED:",
+          homeId,
+          error.message,
+        );
+      }
+    }
+
+    if (
+      updateData.last_event !== undefined &&
+      isPersistentEmergencyIncidentItem({
+        type: resolvedDeviceType,
+      }) &&
+      isEmergencyIncidentItemStillUnsafe(
+        latestHomeData,
+        {
+          deviceId,
+          type: resolvedDeviceType,
+        },
+      ) === false
+    ) {
+      if (firebaseConnected) {
+        try {
+          await resolveClearedPersistentEmergencyIncidents(
+            uid,
+            homeId,
+            {
+              homeOverride: latestHomeData,
+              reason: `${resolvedDeviceType}_cleared`,
+            },
+          );
+        } catch (error) {
+          console.log(
+            "EMERGENCY INCIDENT RESOLVE DEFERRED:",
+            homeId,
+            error.message,
+          );
+        }
+      }
     }
 
 
-    if (updateData.last_event !== undefined) {
+    if (
+      updateData.last_event !== undefined &&
+      firebaseConnected
+    ) {
       let statusText = "";
 
       const currentType = updateData.type || oldData.type || "door";
@@ -11411,7 +16968,27 @@ client.on("message", async (topic, msg) => {
       } else if (currentType === "heat") {
         statusText = "Cập nhật cảnh báo nhiệt";
       } else if (currentType === "carbon_monoxide") {
-        statusText = "Cập nhật cảm biến khí CO";
+        const latestCo = Number(
+          updateData.co ?? oldData.co,
+        );
+        const coText = Number.isFinite(latestCo)
+          ? ` (${latestCo} ppm)`
+          : "";
+
+        statusText = isActiveSignal(
+          updateData.carbon_monoxide ??
+          updateData.co_alarm ??
+          oldData.carbon_monoxide ??
+          oldData.co_alarm,
+        )
+          ? `Phát hiện khí CO${coText}`
+          : `Khí CO đang bình thường${coText}`;
+      } else if (currentType === "siren") {
+        statusText = isActiveSignal(
+          updateData.alarm ?? oldData.alarm,
+        )
+          ? "Còi báo động đang bật"
+          : "Còi báo động đã tắt";
       } else if (currentType === "gas") {
         statusText = "Cập nhật cảm biến gas";
       } else if (
@@ -11440,7 +17017,11 @@ client.on("message", async (topic, msg) => {
       );
     }
 
-    if (updateData.tamper !== undefined && updateData.tamper !== oldTamper) {
+    if (
+      firebaseConnected &&
+      updateData.tamper !== undefined &&
+      updateData.tamper !== oldTamper
+    ) {
       await addDeviceNotification(
         uid,
         homeId,
@@ -11452,47 +17033,47 @@ client.on("message", async (topic, msg) => {
 
     console.log("📡 UPDATE:", deviceId, updateData);
 
-    // ===== NEW MULTI ALARM FORMAT =====
-    await processScheduleAlarmsForOwner(
-      uid,
+    // ===== HOME ALARM RECEIVERS =====
+    // Chủ nhà + sharedByHome/{homeId}; mỗi receiver được xử lý độc lập.
+    const alarmReceiverUids = getAlarmReceiverUidsForHome(
       uid,
       homeId,
-      homeName,
-      deviceId,
-      deviceName,
-      updateData.type || oldData.type || "door",
-      homeData,
-      updateData,
     );
 
-    // ===== SHARED USERS ALARM FROM OWNER HOME SCHEDULE =====
-    const sharedSnap = await db.ref(`sharedByHome/${homeId}`).once("value");
-    const sharedMap = sharedSnap.val() || {};
-    console.log("🚨 SHARED ALARM USERS:", homeId, sharedMap);
+    console.log(
+      "🚨 HOME ALARM RECEIVERS:",
+      homeId,
+      alarmReceiverUids,
+    );
 
-    for (const sharedUid of Object.keys(sharedMap)) {
-      const sharedHomeSnap = await db
-        .ref(`accounts/${sharedUid}/sharedHomes/${homeId}`)
-        .once("value");
-
-      const sharedHomeInfo = sharedHomeSnap.val() || {};
-
-      if (sharedHomeInfo.alarmEnabled === false) {
-        continue;
+    for (const receiverUid of alarmReceiverUids) {
+      try {
+        await processScheduleAlarmsForOwner(
+          receiverUid,
+          uid,
+          homeId,
+          homeName,
+          deviceId,
+          deviceName,
+          updateData.type || oldData.type || "door",
+          homeData,
+          updateData,
+        );
+      } catch (receiverError) {
+        console.log(
+          "HOME ALARM RECEIVER ERROR:",
+          receiverUid,
+          uid,
+          homeId,
+          receiverError.message,
+        );
       }
-
-      await processScheduleAlarmsForOwner(
-        sharedUid,
-        uid,
-        homeId,
-        homeName,
-        deviceId,
-        deviceName,
-        updateData.type || oldData.type || "door",
-        homeData,
-        updateData,
-      );
     }
+
+    await reconcileOfflineAlarmDemandsForHome(
+      uid,
+      homeId,
+    );
   } catch (err) {
     console.log("MQTT ERROR:", err.message);
   }
